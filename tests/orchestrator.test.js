@@ -1360,3 +1360,619 @@ test('orchestrator durum includes version/update status and supports AI_TEXT_PRO
   });
   assert.equal(ignored.reason, 'text_disabled');
 });
+
+test('smart mode ignores trivial noise, debounces normal messages 10m with sliding reset, cancels on owner reply, and breaks on urgent/ptt', async (t) => {
+  const store = await createTempStore(t);
+  const whatsapp = createFakeWhatsApp();
+  let nowMs = Date.parse('2026-11-13T10:00:00+03:00');
+  const startedCalls = [];
+  const scheduledTimers = [];
+  const clearedTimers = [];
+
+  const orch = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: false,
+      aiTextProvider: 'none',
+    },
+    store,
+    whatsapp,
+    callController: {
+      isCallActive: () => false,
+      startCallWithOwner: async (args) => {
+        startedCalls.push(args);
+        return 'answered';
+      },
+    },
+    triageMessage: async ({ event }) => {
+      const body = String(event?.body || '');
+      if (/teşekkür|tamam|👍|doğrulama/i.test(body)) {
+        return { priority: 'ignore', reason: 'trivial', summary: 'Önemsiz', source: 'rule' };
+      }
+      if (/acil|çöktü/i.test(body)) {
+        return { priority: 'urgent', reason: 'urgent_keyword', summary: body, source: 'rule' };
+      }
+      return { priority: 'normal', reason: 'customer_inquiry', summary: body, source: 'rule' };
+    },
+    nowFn: () => nowMs,
+    setTimeoutFn: (fn, delay) => {
+      const handle = { id: scheduledTimers.length + 1, delay, fn };
+      scheduledTimers.push(handle);
+      return handle;
+    },
+    clearTimeoutFn: (handle) => {
+      if (handle) clearedTimers.push(handle.id);
+    },
+  });
+
+  // 1. Trivial noise ("Teşekkürler") is ignored silently (no owner buzz, no call, no delayed timer)
+  const trivialRes = await orch.handleIncomingMessage({
+    id: 'sm-1',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'Teşekkürler',
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.equal(trivialRes.action, 'notify_only');
+  assert.equal(trivialRes.reason, 'trivial_ignored');
+  assert.equal(startedCalls.length, 0);
+  assert.equal(whatsapp.sent.length, 0);
+  assert.equal(Object.keys(store.getPendingDelayedCalls()).length, 0);
+
+  // 2. Normal message buffers a 10-minute delayed call and notifies owner lightly
+  const norm1 = await orch.handleIncomingMessage({
+    id: 'sm-2',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'Merhaba fiyat alabilir miyim?',
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.equal(norm1.reason, 'smart_delayed');
+  assert.equal(startedCalls.length, 0);
+  assert.equal(scheduledTimers[0].delay, 10 * 60_000);
+  assert.equal(store.getPendingDelayedCall(CUSTOMER_CHAT_ID).dueAtMs, nowMs + 10 * 60_000);
+  assert.match(whatsapp.sent[0].text, /10 dk/i);
+
+  // 3. Second normal message at +6 min slides the timer forward to +16 min without calling yet
+  nowMs += 6 * 60_000;
+  await orch.handleIncomingMessage({
+    id: 'sm-3',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'Bir de teslimat süresini soracaktım',
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.equal(store.getPendingDelayedCall(CUSTOMER_CHAT_ID).dueAtMs, nowMs + 10 * 60_000);
+  assert.equal(store.getPendingDelayedCall(CUSTOMER_CHAT_ID).messages.length, 2);
+
+  // Still not due at +9 min after 2nd message
+  nowMs += 9 * 60_000;
+  await orch.processScheduledEvents(nowMs);
+  assert.equal(startedCalls.length, 0);
+
+  // Due at +10 min after 2nd message -> triggers single consolidated call and clears pending entry
+  nowMs += 1 * 60_000;
+  await orch.processScheduledEvents(nowMs);
+  assert.equal(startedCalls.length, 1);
+  assert.equal(store.getPendingDelayedCall(CUSTOMER_CHAT_ID), null);
+
+  // 4. Manual owner reply cancels an active delayed timer
+  const cust2 = '905550000201@c.us';
+  nowMs += 5 * 60_000;
+  await orch.handleIncomingMessage({
+    id: 'sm-4',
+    from: cust2,
+    phone: '905550000201',
+    fromMe: false,
+    type: 'chat',
+    body: 'Stok var mı?',
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.ok(store.getPendingDelayedCall(cust2));
+
+  nowMs += 2 * 60_000;
+  await orch.handleIncomingMessage({
+    id: 'sm-4-owner',
+    from: cust2,
+    to: cust2,
+    fromMe: true,
+    type: 'chat',
+    body: 'Evet elimizde mevcut.',
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.equal(store.getPendingDelayedCall(cust2), null);
+  nowMs += 15 * 60_000;
+  await orch.processScheduledEvents(nowMs);
+  assert.equal(startedCalls.length, 1);
+
+  // 5. Urgent message breaks active timer immediately
+  const cust3 = '905550000202@c.us';
+  await orch.handleIncomingMessage({
+    id: 'sm-5',
+    from: cust3,
+    phone: '905550000202',
+    fromMe: false,
+    type: 'chat',
+    body: 'Merhaba bir bakabilir misiniz',
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.ok(store.getPendingDelayedCall(cust3));
+  nowMs += 60_000;
+  await orch.handleIncomingMessage({
+    id: 'sm-6',
+    from: cust3,
+    phone: '905550000202',
+    fromMe: false,
+    type: 'chat',
+    body: 'ACİL sunucu çöktü hemen arayın!',
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.equal(store.getPendingDelayedCall(cust3), null);
+  assert.equal(startedCalls.length, 2);
+
+  // 6. Voice note (ptt) calls immediately in smart mode without delay
+  const cust4 = '905550000203@c.us';
+  nowMs += 60_000;
+  await orch.handleIncomingMessage({
+    id: 'sm-7',
+    from: cust4,
+    phone: '905550000203',
+    fromMe: false,
+    type: 'ptt',
+    body: '',
+    hasMedia: true,
+    timestamp: Math.floor(nowMs / 1000),
+  });
+  assert.equal(startedCalls.length, 3);
+  assert.equal(clearedTimers.length > 0, true);
+});
+
+test('quiet hours buffers silently at night, wakes only on critical if allowed, transfers crossing timers, and supports auto vs ask morning resume', async (t) => {
+  // Part A: Auto mode + crossing 22:00 timer + allowUrgent toggle
+  const storeA = await createTempStore(t);
+  const waA = createFakeWhatsApp();
+  let nowA = Date.parse('2026-11-13T21:55:00+03:00');
+  const callsA = [];
+
+  const orchA = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: true,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '09:00',
+      quietHoursResumeMode: 'auto',
+      quietHoursAllowUrgent: false,
+      aiTextProvider: 'none',
+    },
+    store: storeA,
+    whatsapp: waA,
+    callController: {
+      isCallActive: () => false,
+      startCallWithOwner: async (args) => {
+        callsA.push(args);
+        return 'answered';
+      },
+    },
+    triageMessage: async ({ event }) => {
+      const b = String(event?.body || '');
+      if (/sistem.*çöktü|çok acil|üretim durdu/i.test(b)) {
+        return { priority: 'critical', reason: 'critical_outage', summary: b, source: 'rule' };
+      }
+      if (/acil/i.test(b)) {
+        return { priority: 'urgent', reason: 'urgent', summary: b, source: 'rule' };
+      }
+      return { priority: 'normal', reason: 'inquiry', summary: b, source: 'rule' };
+    },
+    nowFn: () => nowA,
+    setTimeoutFn: () => ({ id: 1 }),
+    clearTimeoutFn: () => {},
+  });
+
+  // 21:55 normal message schedules dueAt = 22:05 (crosses 22:00 quiet start!)
+  await orchA.handleIncomingMessage({
+    id: 'qa-m1',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'Fiyat bilgisi rica edebilir miyim',
+    timestamp: Math.floor(nowA / 1000),
+  });
+  const sentBeforeNight = waA.sent.length;
+
+  // At 22:06, timer would fire during quiet hours -> transfers to quietQueue silently without calling or pinging owner!
+  nowA = Date.parse('2026-11-13T22:06:00+03:00');
+  await orchA.processScheduledEvents(nowA);
+  assert.equal(callsA.length, 0);
+  assert.equal(waA.sent.length, sentBeforeNight);
+  assert.equal(storeA.getPendingDelayedCall(CUSTOMER_CHAT_ID), null);
+  assert.equal(storeA.getQuietQueue().length, 1);
+
+  // Critical message at 23:30 stays in quietQueue when quietHoursAllowUrgent is false
+  nowA = Date.parse('2026-11-13T23:30:00+03:00');
+  await orchA.handleIncomingMessage({
+    id: 'qa-m2',
+    from: '905550000205@c.us',
+    phone: '905550000205',
+    fromMe: false,
+    type: 'chat',
+    body: 'Üretim durdu sistem çöktü acil!',
+    timestamp: Math.floor(nowA / 1000),
+  });
+  assert.equal(callsA.length, 0);
+  assert.equal(waA.sent.length, sentBeforeNight);
+  assert.equal(storeA.getQuietQueue().length, 2);
+
+  // Enable quietHoursAllowUrgent -> normal & urgent stay silent, critical wakes immediately
+  storeA.setCallSettingsOverrides({ quietHoursAllowUrgent: true });
+  nowA = Date.parse('2026-11-14T01:10:00+03:00');
+  await orchA.handleIncomingMessage({
+    id: 'qa-m3',
+    from: '905550000206@c.us',
+    phone: '905550000206',
+    fromMe: false,
+    type: 'chat',
+    body: 'Acil bilgi lazım',
+    timestamp: Math.floor(nowA / 1000),
+  });
+  assert.equal(callsA.length, 0);
+  assert.equal(storeA.getQuietQueue().length, 3);
+
+  nowA = Date.parse('2026-11-14T01:20:00+03:00');
+  await orchA.handleIncomingMessage({
+    id: 'qa-m4',
+    from: '905550000207@c.us',
+    phone: '905550000207',
+    fromMe: false,
+    type: 'chat',
+    body: 'Çok acil sistem tamamen çöktü!',
+    timestamp: Math.floor(nowA / 1000),
+  });
+  assert.equal(callsA.length, 1);
+
+  // 09:00 auto mode delivers single morning digest and clears queue
+  nowA = Date.parse('2026-11-14T09:00:00+03:00');
+  await orchA.processScheduledEvents(nowA);
+  assert.equal(storeA.getQuietQueue().length, 0);
+  const digestMsgs = waA.sent.slice(sentBeforeNight).filter((m) => /bekleyen mesajlar/i.test(m.text));
+  assert.equal(digestMsgs.length, 1);
+  assert.match(digestMsgs[0].text, /905550000205|Müşteri/i);
+
+  // Running processScheduledEvents again does not duplicate digest
+  await orchA.processScheduledEvents(nowA + 60_000);
+  assert.equal(waA.sent.slice(sentBeforeNight).filter((m) => /bekleyen mesajlar/i.test(m.text)).length, 1);
+
+  // Part B: Ask mode (no false daytime prompt, asks at 09:00 after night activity, holds until 'evet')
+  const storeB = await createTempStore(t);
+  const waB = createFakeWhatsApp();
+  let nowB = Date.parse('2026-11-13T14:00:00+03:00');
+  const callsB = [];
+  const orchB = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: true,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '09:00',
+      quietHoursResumeMode: 'ask',
+      quietHoursAllowUrgent: false,
+      aiTextProvider: 'none',
+    },
+    store: storeB,
+    whatsapp: waB,
+    callController: {
+      isCallActive: () => false,
+      startCallWithOwner: async (args) => {
+        callsB.push(args);
+        return 'answered';
+      },
+    },
+    triageMessage: async ({ event }) => ({
+      priority: 'normal',
+      reason: 'inquiry',
+      summary: String(event?.body || ''),
+      source: 'rule',
+    }),
+    nowFn: () => nowB,
+    setTimeoutFn: () => ({ id: 1 }),
+    clearTimeoutFn: () => {},
+  });
+
+  // 14:00 daytime fresh startup must NOT spuriously ask to start work
+  await orchB.processScheduledEvents(nowB);
+  assert.equal(waB.sent.length, 0);
+
+  // Night message arrives at 23:00
+  nowB = Date.parse('2026-11-13T23:00:00+03:00');
+  await orchB.handleIncomingMessage({
+    id: 'qb-m1',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'Yarın için randevu almak istiyorum',
+    timestamp: Math.floor(nowB / 1000),
+  });
+  assert.equal(waB.sent.length, 0);
+  assert.equal(storeB.getQuietScheduleState().wasQuietPendingResume, true);
+
+  // At 09:00, asks owner for confirmation before resuming
+  nowB = Date.parse('2026-11-14T09:00:00+03:00');
+  await orchB.processScheduledEvents(nowB);
+  assert.equal(storeB.getQuietScheduleState().awaitingOwnerConfirm, true);
+  assert.equal(waB.sent.length, 1);
+  assert.match(waB.sent[0].text, /mesai başlasın mı/i);
+
+  // Customer message at 09:10 while awaiting confirmation is still buffered silently
+  nowB = Date.parse('2026-11-14T09:10:00+03:00');
+  await orchB.handleIncomingMessage({
+    id: 'qb-m2',
+    from: '905550000208@c.us',
+    phone: '905550000208',
+    fromMe: false,
+    type: 'chat',
+    body: 'Sabah fiyat sormak istedim',
+    timestamp: Math.floor(nowB / 1000),
+  });
+  assert.equal(callsB.length, 0);
+  assert.equal(storeB.getQuietQueue().length, 2);
+
+  // Owner replies "evet" (AI_TEXT_PROVIDER=none fallback) -> confirms resume and delivers digest
+  nowB = Date.parse('2026-11-14T09:12:00+03:00');
+  await orchB.handleIncomingMessage({
+    id: 'qb-owner-yes',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'evet',
+    timestamp: Math.floor(nowB / 1000),
+  });
+  assert.equal(storeB.getQuietScheduleState().awaitingOwnerConfirm, false);
+  assert.equal(storeB.getQuietScheduleState().resumeConfirmedYmd, '2026-11-14');
+  assert.equal(storeB.getQuietQueue().length, 0);
+  const afterConfirmText = waB.sent.slice(1).map((m) => m.text).join('\n');
+  assert.match(afterConfirmText, /bekleyen mesajlar/i);
+
+  // durum command reports Arama Modu, Gecikme, Mesai Dışı
+  const beforeDurum = waB.sent.length;
+  await orchB.handleIncomingMessage({
+    id: 'qb-durum',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'durum',
+    timestamp: Math.floor(nowB / 1000) + 5,
+  });
+  const durumText = waB.sent[beforeDurum].text;
+  assert.match(durumText, /Arama Modu:/i);
+  assert.match(durumText, /Mesai Dışı:/i);
+});
+
+test('urgent break and quiet transfer preserve prior buffered delayed messages, and ara/cooldown suppress duplicate scheduled calls', async (t) => {
+  // 1. Urgent message breaking 10-min debounce preserves earlier buffered messages
+  const store1 = await createTempStore(t);
+  const wa1 = createFakeWhatsApp({
+    contactsList: [{ name: 'Ahmet Test', phone: '905550000200', chatId: CUSTOMER_CHAT_ID }],
+  });
+  let now1 = Date.parse('2026-11-13T10:00:00+03:00');
+  const liveContexts = [];
+
+  const orch1 = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: true,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '09:00',
+      quietHoursResumeMode: 'auto',
+      quietHoursAllowUrgent: false,
+      aiTextProvider: 'none',
+    },
+    store: store1,
+    whatsapp: wa1,
+    callController: {
+      isCallActive: () => false,
+      startCallWithOwner: async (callbacks) => {
+        const sess = {
+          hangUp: async () => 'normal',
+          waitForEnd: () => new Promise((r) => setTimeout(() => r('answered'), 15)),
+          getOutcome: () => 'answered',
+        };
+        await callbacks.onConnected?.(sess);
+        return sess;
+      },
+    },
+    startLiveSession: async ({ customerContext }) => {
+      liveContexts.push(customerContext);
+      return { sendOwnerAudio() {}, close() {} };
+    },
+    triageMessage: async ({ event }) => {
+      const b = String(event?.body || '');
+      if (/acil|ACİL/i.test(b)) {
+        return { priority: 'urgent', reason: 'urgent', summary: b, source: 'rule' };
+      }
+      return { priority: 'normal', reason: 'normal', summary: b, source: 'rule' };
+    },
+    nowFn: () => now1,
+    setTimeoutFn: () => ({ id: 1 }),
+    clearTimeoutFn: () => {},
+  });
+
+  await orch1.handleIncomingMessage({
+    id: 'urg-1',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'Merhaba bir siparişim vardı',
+    timestamp: Math.floor(now1 / 1000),
+  });
+  now1 += 2 * 60_000;
+  await orch1.handleIncomingMessage({
+    id: 'urg-2',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'Kargo adresi de değişecekti',
+    timestamp: Math.floor(now1 / 1000),
+  });
+  now1 += 60_000;
+  const sentBeforeUrgent = wa1.sent.length;
+  await orch1.handleIncomingMessage({
+    id: 'urg-3',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905550000200',
+    fromMe: false,
+    type: 'chat',
+    body: 'ACİL hemen dönüş yapar mısınız!',
+    timestamp: Math.floor(now1 / 1000),
+  });
+
+  assert.equal(store1.getPendingDelayedCall(CUSTOMER_CHAT_ID), null);
+  assert.equal(liveContexts.length, 1);
+  assert.match(liveContexts[0].triggerMessage, /siparişim vardı/i);
+  assert.match(liveContexts[0].triggerMessage, /Kargo adresi/i);
+  assert.match(liveContexts[0].triggerMessage, /ACİL/i);
+  const urgentNotice = wa1.sent.slice(sentBeforeUrgent).map((m) => m.text).join('\n');
+  assert.match(urgentNotice, /siparişim vardı/i);
+  assert.match(urgentNotice, /Kargo adresi/i);
+
+  // Night transition preserves earlier buffered messages into quietQueue too
+  const custNight = '905550000215@c.us';
+  now1 = Date.parse('2026-11-13T21:55:00+03:00');
+  await orch1.handleIncomingMessage({
+    id: 'qn-1',
+    from: custNight,
+    phone: '905550000215',
+    fromMe: false,
+    type: 'chat',
+    body: 'Fatura kopyasını alabilir miyim',
+    timestamp: Math.floor(now1 / 1000),
+  });
+  now1 = Date.parse('2026-11-13T22:01:00+03:00');
+  await orch1.handleIncomingMessage({
+    id: 'qn-2',
+    from: custNight,
+    phone: '905550000215',
+    fromMe: false,
+    type: 'chat',
+    body: 'Vergi numaramızı ekleyin lütfen',
+    timestamp: Math.floor(now1 / 1000),
+  });
+  assert.equal(store1.getPendingDelayedCall(custNight), null);
+  const qItem = store1.getQuietQueue().find((q) => q.chatId === custNight);
+  assert.ok(qItem);
+  assert.match(qItem.summary, /Fatura kopyasını/i);
+  assert.match(qItem.summary, /Vergi numaramızı/i);
+
+  // 2. Owner command `ara <isim>` clears pendingDelayedCalls & quietQueue immediately, and runScheduledTick respects full 120m cooldowns
+  const store2 = await createTempStore(t);
+  const custAra = '905550000222@c.us';
+  const wa2 = createFakeWhatsApp({
+    contactsList: [{ name: 'Zeynep Erken', phone: '905550000222', chatId: custAra }],
+  });
+  let now2 = Date.parse('2026-11-13T11:00:00+03:00');
+  let callCount2 = 0;
+
+  const orch2 = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      cooldownMinutes: 120,
+      quietHoursEnabled: false,
+      aiTextProvider: 'none',
+    },
+    store: store2,
+    whatsapp: wa2,
+    callController: {
+      isCallActive: () => false,
+      startCallWithOwner: async () => {
+        callCount2 += 1;
+        return 'answered';
+      },
+    },
+    triageMessage: async ({ event }) => ({
+      priority: 'normal',
+      reason: 'normal',
+      summary: String(event?.body || ''),
+      source: 'rule',
+    }),
+    nowFn: () => now2,
+    setTimeoutFn: () => ({ id: 1 }),
+    clearTimeoutFn: () => {},
+  });
+
+  await orch2.handleIncomingMessage({
+    id: 'ara-q1',
+    from: custAra,
+    phone: '905550000222',
+    fromMe: false,
+    type: 'chat',
+    body: 'Ürün fiyatı nedir?',
+    timestamp: Math.floor(now2 / 1000),
+  });
+  store2.enqueueQuietMessage({
+    chatId: custAra,
+    customerName: 'Zeynep Erken',
+    phone: '905550000222',
+    priority: 'normal',
+    summary: 'Önceki gece sordu',
+    latestMessage: 'Ürün?',
+    atMs: now2 - 3600_000,
+  });
+  assert.ok(store2.getPendingDelayedCall(custAra));
+
+  now2 += 60_000;
+  await orch2.handleIncomingMessage({
+    id: 'ara-cmd',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'ara Zeynep',
+    timestamp: Math.floor(now2 / 1000),
+  });
+  assert.equal(callCount2, 1);
+  assert.equal(store2.getPendingDelayedCall(custAra), null);
+  assert.equal(store2.getQuietQueue().some((q) => q.chatId === custAra), false);
+
+  // Even if a pendingDelayedCall were left stale after answered call or 45-min-old lastTextReplyAt (<120m), runScheduledTick skips calling
+  const custCd = '905550000223@c.us';
+  store2.updateChatState(custCd, { lastTextReplyAt: now2 - 45 * 60_000 });
+  store2.upsertPendingDelayedCall({
+    chatId: custCd,
+    customerName: 'Cooldown Müşteri',
+    dueAtMs: now2 + 1000,
+    messages: ['Selam'],
+  });
+  const custAns = '905550000224@c.us';
+  store2.updateChatState(custAns, { lastCallAt: now2 - 60 * 60_000, lastCallStatus: 'answered' });
+  store2.upsertPendingDelayedCall({
+    chatId: custAns,
+    customerName: 'Answered Müşteri',
+    dueAtMs: now2 + 1000,
+    messages: ['Selam 2'],
+  });
+
+  now2 += 5000;
+  await orch2.processScheduledEvents(now2);
+  assert.equal(callCount2, 1);
+  assert.equal(store2.getPendingDelayedCall(custCd), null);
+  assert.equal(store2.getPendingDelayedCall(custAns), null);
+});

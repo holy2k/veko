@@ -6,6 +6,7 @@
 [![Voice AI](https://img.shields.io/badge/Voice%20AI-Gemini%20Live%20%7C%20OpenAI%20Realtime-4285F4)](#supported-ai-providers)
 [![Text AI](https://img.shields.io/badge/Text%20AI-Gemini%20%7C%20OpenAI%20%7C%20DeepSeek%20%7C%20Ollama%20%7C%20Claude-111827)](#supported-ai-providers)
 [![WhatsApp WebRTC](https://img.shields.io/badge/WhatsApp%20Web-WebRTC%20%2B%20AudioWorklet-25D366?logo=whatsapp&logoColor=white)](#architecture)
+[![Release](https://img.shields.io/badge/Release-v0.2.1-0ea5e9)](#whats-new-in-v021)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Language Optimization Notice:** Veko is currently optimized for **Turkish** (system prompts, WhatsApp commands, and `Europe/Istanbul` calendar analytics). Support and optimizations for English and additional languages will be added and shared progressively.
@@ -54,6 +55,11 @@ flowchart LR
 * **Verified `@lid` Identity Resolution:** Resolves WhatsApp `@lid` identifiers with reverse `OWNER_PHONE` verification so unknown or unresolved `@lid` calls are never auto-answered.
 * **Non-Intrusive Update Notifications:** Sends a one-time setup message upon first installation, applies a 15-minute cooldown to restart notices, and never wakes the owner at night — delivering new release notices only right after an answered call or text chat turn (toggleable via natural language or *"Güncelleme bildirimi kapat"*).
 * **Channel Filtering:** Ignores groups (`@g.us`), status updates (`status@broadcast`), broadcast lists, and newsletters (`@newsletter`).
+
+### 🎯 Smart Triage, 10-Min Debounce & Quiet Hours
+* **Two-Tier Noise Filtering (`CALL_POLICY=smart`):** Zero-cost rules ignore trivial closings (`"tamam"`, `"teşekkürler"`, pure emojis, stickers) and automated OTP/bank notifications, while the configured text AI triages customer intent (`ignore`, `normal`, `urgent`, `critical`).
+* **Sliding 10-Minute Debounce (`CALL_DELAY_MINUTES=10`):** Normal inquiries buffer until the customer finishes texting (resetting per message, cancelling if you reply manually, and calling immediately on `urgent`/`critical` messages or voice notes).
+* **Quiet Hours & Morning Check-In (`QUIET_HOURS_*`):** Silently queues non-critical messages during `Europe/Istanbul` quiet hours (optionally waking only for `critical` emergencies when `QUIET_HOURS_ALLOW_URGENT=true`), then delivers a single morning digest (`auto`) or asks `"mesai başlasın mı?"` (`ask`) — all controllable at runtime via WhatsApp text/voice (`get_call_settings` / `update_call_settings`).
 
 ---
 
@@ -124,6 +130,13 @@ GEMINI_API_KEY=AIza...
 | `AI_TEXT_BASE_URL` | Provider default | Custom API / Ollama / OpenAI-compatible base URL |
 | `CHROME_HEADLESS` | `new` | Use `false` for live WebRTC voice calls |
 | `CHROME_EXECUTABLE_PATH` | *(auto)* | Custom Chrome/Edge executable path |
+| `CALL_POLICY` | `smart` | Call trigger policy: `smart` (triage + debounce), `always` (immediate call), or `on_demand` (text notify only) |
+| `CALL_DELAY_MINUTES` | `10` | Sliding wait delay (min) before calling for `normal` messages in `smart` mode |
+| `QUIET_HOURS_ENABLED` | `false` | Enable `Europe/Istanbul` quiet hours (auto-enables when start/end are set unless `false`) |
+| `QUIET_HOURS_START` | `22:00` | Quiet hours start time (`HH:MM`, Istanbul time) |
+| `QUIET_HOURS_END` | `09:00` | Quiet hours end time (`HH:MM`, Istanbul time) |
+| `QUIET_HOURS_RESUME_MODE` | `auto` | Morning resume behavior: `auto` (consolidated digest) or `ask` (ask confirmation first) |
+| `QUIET_HOURS_ALLOW_URGENT` | `false` | Allow `critical` emergencies to ring during quiet hours when `true` |
 | `CALL_RING_TIMEOUT_SEC` | `35` | Ring timeout in seconds |
 | `CALL_MAX_DURATION_SEC` | `300` | Maximum call duration in seconds |
 | `COOLDOWN_MINUTES` | `120` | Cooldown after an answered/rejected call or approved text reply (min) |
@@ -149,13 +162,13 @@ npm start
 3. To receive notifications from GitHub when new releases ship, enable **Watch → Custom → Releases** at the top of this repository.
 
 ### Quick WhatsApp Commands (from Owner)
-* `durum` — Shows active/silenced status, active/pending call, app version, and update notification state.
+* `durum` — Shows active/silenced status, active/pending call, call policy/delay, quiet-hours queue status, app version, and update notification state.
 * `ara` — Initiates a voice call for the latest pending customer chat.
 * `ara <name or phone>` — Searches contacts and starts a call with the matched chat's context.
 * `sustur <minutes>` — Silences voice calls for N minutes (defaults to `60`).
 * `devam` — Resumes voice calls immediately.
 
-Any other message from `OWNER_PHONE` is routed to the Veko text assistant (including natural-language requests to enable, disable, or check update notifications).
+Any other message from `OWNER_PHONE` is routed to the Veko text assistant (including customer counts, chat summaries, 2-step draft-locked replies, runtime call/quiet-hours adjustments, and natural-language requests to enable, disable, or check update notifications).
 
 ---
 
@@ -167,7 +180,7 @@ To keep headed Chrome/Edge and WebRTC audio active after closing RDP:
 powershell -ExecutionPolicy Bypass -File scripts/vds-setup.ps1 -InstallPm2 -RegisterScheduledTask
 ```
 
-When disconnecting from RDP, run [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) **as Administrator** (`tscon %SESSIONNAME% /dest:console`) so the desktop session stays active without locking.
+When disconnecting from RDP, run [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) **as Administrator** (`tscon` using the active Windows `SessionId`) so the desktop session stays active without locking.
 
 ---
 
@@ -180,6 +193,16 @@ npm test
 # WebRTC / voice call DOM & AudioWorklet spike check
 npm run spike
 ```
+
+---
+
+## 🆕 What's New in v0.2.1
+
+* **Smart Call Triage (`CALL_POLICY=smart`):** Filters trivial closings, stickers, emojis, and automated OTP/bank alerts at zero AI cost, while prioritizing real inquiries (`ignore`, `normal`, `urgent`, `critical`).
+* **Sliding 10-Min Debounce (`CALL_DELAY_MINUTES=10`):** Batches multi-message customer inquiries into one call and breaks immediately for urgent messages or voice notes.
+* **Quiet Hours & Morning Resume (`QUIET_HOURS_*`):** Buffers overnight/off-hours messages silently in `Europe/Istanbul` time with `auto` digest delivery or `ask` morning confirmation & snooze controls.
+* **WhatsApp Runtime Settings Tools:** Inspect and adjust call policy, delay minutes, quiet hours, snooze, and morning resume via natural-language WhatsApp chat or voice (`get_call_settings` / `update_call_settings`).
+* **VDS Disconnect Script Fix:** Updated [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) to resolve the live Windows `SessionId` cleanly instead of relying on a stale `SESSIONNAME`.
 
 ---
 

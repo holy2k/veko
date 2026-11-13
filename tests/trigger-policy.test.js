@@ -398,3 +398,30 @@ test('tracks customer metadata and enforces lastTextReplyAt cooldown and aiVoice
   assert.equal(callNoVoice.action, 'ignore');
   assert.equal(callNoVoice.reason, 'voice_disabled');
 });
+
+test('enforces on_demand call policy via config or runtime store override', () => {
+  const store = makeStore();
+  const cust1 = '905559990011@c.us';
+  const t0 = 6_000_000;
+
+  const onDemandCfg = { ...cfg, callPolicy: 'on_demand' };
+  const res1 = evaluateIncomingMessage(
+    { id: 'od-1', from: cust1, fromMe: false, body: 'Merhaba fiyat nedir?' },
+    { config: onDemandCfg, store, callInProgress: false, nowMs: t0 }
+  );
+  assert.equal(res1.action, 'notify_only');
+  assert.equal(res1.reason, 'on_demand_policy');
+  assert.equal(store.getPendingCallChatId(), null);
+  assert.equal(store.getChatState(cust1).customerMessageCount, 1);
+
+  // Store override takes precedence even when config is always/smart
+  store.setCallSettingsOverrides({ callPolicy: 'on_demand' });
+  const cust2 = '905559990012@c.us';
+  const res2 = evaluateIncomingMessage(
+    { id: 'od-2', from: cust2, fromMe: false, body: 'Stok var mı?' },
+    { config: { ...cfg, callPolicy: 'always' }, store, callInProgress: false, nowMs: t0 + 10_000 }
+  );
+  assert.equal(res2.action, 'notify_only');
+  assert.equal(res2.reason, 'on_demand_policy');
+  assert.equal(store.getPendingCallChatId(), null);
+});

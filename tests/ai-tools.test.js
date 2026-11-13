@@ -56,17 +56,19 @@ function makeEnv(extra = {}) {
   return { store, sent, fetched, whatsapp, config };
 }
 
-test('TOOL_DECLARATIONS defines all 7 Gemini function declarations with SDK Type enums', () => {
+test('TOOL_DECLARATIONS defines all 9 Gemini function declarations with SDK Type enums', () => {
   assert.equal(Array.isArray(TOOL_DECLARATIONS), true);
   const byName = new Map(TOOL_DECLARATIONS.map((d) => [d.name, d]));
   assert.deepEqual(Array.from(byName.keys()).sort(), [
     'check_for_updates',
     'end_call',
+    'get_call_settings',
     'get_chat_history',
     'list_recent_chats',
     'search_contacts',
     'send_whatsapp_message',
     'set_update_notifications',
+    'update_call_settings',
   ]);
   for (const decl of TOOL_DECLARATIONS) {
     assert.equal(decl.parameters.type, Type.OBJECT);
@@ -326,7 +328,7 @@ test('startGeminiLiveSession connects via @google/genai Live API, streams audio,
     voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
     languageCode: 'tr-TR',
   });
-  assert.equal(capturedConnectParams.config.tools[0].functionDeclarations.length, 7);
+  assert.equal(capturedConnectParams.config.tools[0].functionDeclarations.length, 9);
 
   // Initial greeting turn triggered automatically once connected
   assert.equal(clientContents.length, 1);
@@ -492,7 +494,7 @@ test('startGeminiLiveSession passes real @google/genai v3.3.0 setup, audio, gree
     voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
     languageCode: 'tr-TR',
   });
-  assert.equal(wireSent[0].setup.tools[0].functionDeclarations.length, 7);
+  assert.equal(wireSent[0].setup.tools[0].functionDeclarations.length, 9);
   assert.equal(wireSent[0].setup.tools[0].functionDeclarations[0].parameters.type, 'OBJECT');
 
   assert.equal(wireSent[1].clientContent.turnComplete, true);
@@ -942,18 +944,20 @@ test('buildSystemInstruction and buildInitialGreetingPrompt handle owner_initiat
   assert.match(pendingGreeting, /Selin Kaya/);
 });
 
-test('TEXT_TOOL_DECLARATIONS includes analytics and draft-clear tools and excludes end_call', () => {
+test('TEXT_TOOL_DECLARATIONS includes analytics, settings, and draft-clear tools and excludes end_call', () => {
   assert.equal(Array.isArray(TEXT_TOOL_DECLARATIONS), true);
   const names = TEXT_TOOL_DECLARATIONS.map((d) => d.name).sort();
   assert.deepEqual(names, [
     'check_for_updates',
     'clear_pending_draft',
+    'get_call_settings',
     'get_chat_history',
     'get_customer_stats',
     'list_recent_chats',
     'search_contacts',
     'send_whatsapp_message',
     'set_update_notifications',
+    'update_call_settings',
   ]);
 });
 
@@ -1359,4 +1363,218 @@ test('set_update_notifications and check_for_updates tools toggle state and chec
   assert.equal(failRes.ok, false);
   assert.equal(failRes.hasUpdate, false);
   assert.equal(failRes.latestVersion, null);
+});
+
+test('get_call_settings and update_call_settings manage runtime policy, quiet hours, snooze, morning resume, and reset', async () => {
+  const { store, whatsapp, config } = makeEnv();
+  const baseConfig = {
+    ...config,
+    callPolicy: 'smart',
+    callDelayMinutes: 10,
+    quietHoursEnabled: true,
+    quietHoursStart: '22:00',
+    quietHoursEnd: '09:00',
+    quietHoursResumeMode: 'ask',
+    quietHoursAllowUrgent: false,
+  };
+
+  store.upsertPendingDelayedCall({
+    chatId: '905551110001@c.us',
+    customerName: 'Ali',
+    dueAtMs: Date.parse('2026-11-13T09:20:00+03:00'),
+    messages: ['Fiyat alabilir miyim?'],
+  });
+  store.enqueueQuietMessage({
+    chatId: '905551110002@c.us',
+    customerName: 'Veli',
+    priority: 'normal',
+    summary: 'Gece bilgi sordu',
+    latestMessage: 'Sabah dönüş yapar mısınız?',
+    atMs: Date.parse('2026-11-13T01:15:00+03:00'),
+  });
+  store.setQuietScheduleState({
+    wasQuietPendingResume: true,
+    awaitingOwnerConfirm: true,
+    lastMorningPromptYmd: '2026-11-13',
+  });
+
+  const morningNow = Date.parse('2026-11-13T09:05:00+03:00');
+  const execText = createToolExecutor({
+    whatsapp,
+    store,
+    config: baseConfig,
+    mode: 'text',
+    nowMs: () => morningNow,
+  });
+
+  const current = await execText('get_call_settings', {});
+  assert.equal(current.ok, true);
+  assert.equal(current.settings.callPolicy, 'smart');
+  assert.equal(current.settings.callDelayMinutes, 10);
+  assert.equal(current.settings.quietHoursEnabled, true);
+  assert.equal(current.settings.quietHoursResumeMode, 'ask');
+  assert.equal(current.quietStatus.awaitingOwnerConfirm, true);
+  assert.equal(current.quietStatus.isQuietNow, true);
+  assert.equal(current.pendingDelayedCount, 1);
+  assert.equal(current.quietQueueCount, 1);
+
+  // Invalid update leaves store untouched
+  const invalid = await execText('update_call_settings', {
+    callPolicy: 'bogus',
+    callDelayMinutes: 5,
+  });
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.error, /callPolicy/i);
+  assert.equal(store.getCallSettingsOverrides().callDelayMinutes, undefined);
+
+  const invalidSnooze = await execText('update_call_settings', { snoozeMinutes: 999 });
+  assert.equal(invalidSnooze.ok, false);
+  assert.match(invalidSnooze.error, /snoozeMinutes/i);
+
+  // Valid update persists runtime overrides and works in voice mode too
+  const execVoice = createToolExecutor({
+    whatsapp,
+    store,
+    config: baseConfig,
+    mode: 'voice',
+    nowMs: () => morningNow,
+  });
+  const updated = await execVoice('update_call_settings', {
+    callDelayMinutes: 5,
+    quietHoursStart: '23:30',
+    quietHoursEnd: '08:30',
+    quietHoursAllowUrgent: true,
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(updated.settings.callDelayMinutes, 5);
+  assert.equal(updated.settings.quietHoursStart, '23:30');
+  assert.equal(updated.settings.quietHoursEnd, '08:30');
+  assert.equal(updated.settings.quietHoursAllowUrgent, true);
+
+  // Morning resume confirmation clears awaitingOwnerConfirm and flushes quietQueue safely
+  const resumed = await execText('update_call_settings', { confirmMorningResume: true });
+  assert.equal(resumed.ok, true);
+  assert.equal(resumed.confirmedMorningResume, true);
+  assert.equal(resumed.flushedQuietQueueCount, 1);
+  assert.equal(resumed.flushedQuietMessages[0].customerName, 'Veli');
+  assert.equal(resumed.quietStatus.awaitingOwnerConfirm, false);
+  assert.equal(resumed.quietStatus.isQuietNow, false);
+  assert.equal(store.getQuietQueue().length, 0);
+  assert.equal(store.getQuietScheduleState().resumeConfirmedYmd, '2026-11-13');
+
+  // Snooze until specific Istanbul time & clearSnooze
+  const snoozed = await execText('update_call_settings', { snoozeUntilTime: '10:30' });
+  assert.equal(snoozed.ok, true);
+  assert.equal(snoozed.quietStatus.snoozeActive, true);
+  assert.equal(snoozed.quietStatus.isQuietNow, true);
+  assert.equal(store.getQuietScheduleState().snoozedUntilMs, Date.parse('2026-11-13T10:30:00+03:00'));
+
+  const unsnoozed = await execText('update_call_settings', { clearSnooze: true });
+  assert.equal(unsnoozed.ok, true);
+  assert.equal(unsnoozed.quietStatus.snoozeActive, false);
+  assert.equal(store.getQuietScheduleState().snoozedUntilMs, null);
+
+  // Reset reverts back to .env config defaults
+  const reset = await execText('update_call_settings', { resetToEnvDefaults: true });
+  assert.equal(reset.ok, true);
+  assert.equal(reset.settings.callDelayMinutes, 10);
+  assert.equal(reset.settings.quietHoursStart, '22:00');
+  assert.equal(reset.settings.quietHoursAllowUrgent, false);
+  assert.deepEqual(store.getCallSettingsOverrides(), {});
+});
+
+test('send_whatsapp_message clears pendingDelayedCalls and quietQueue in both text and voice modes', async () => {
+  const { store, whatsapp, config } = makeEnv();
+  const cust1 = '905551110003@c.us';
+  const cust2 = '905551110004@c.us';
+
+  // Stage delayed call & quiet queue for cust1 (text mode) and cust2 (voice mode)
+  store.upsertPendingDelayedCall({
+    chatId: cust1,
+    customerName: 'Ahmet Yılmaz',
+    dueAtMs: 2_000_000,
+    messages: ['Fiyat alabilir miyim?'],
+  });
+  store.enqueueQuietMessage({
+    chatId: cust1,
+    customerName: 'Ahmet Yılmaz',
+    phone: '905551110003',
+    priority: 'normal',
+    summary: 'Gece mesajı',
+    latestMessage: 'Fiyat?',
+    atMs: 1_500_000,
+  });
+  store.upsertPendingDelayedCall({
+    chatId: cust2,
+    customerName: 'Ayşe Demir',
+    dueAtMs: 2_100_000,
+    messages: ['Bilgi istiyorum'],
+  });
+  store.enqueueQuietMessage({
+    chatId: cust2,
+    customerName: 'Ayşe Demir',
+    phone: '905551110004',
+    priority: 'normal',
+    summary: 'Gece mesajı 2',
+    latestMessage: 'Bilgi?',
+    atMs: 1_500_000,
+  });
+
+  // Text mode 2-turn confirmed send clears cust1's pendingDelayedCalls and quietQueue
+  const execTextDraft = createToolExecutor({
+    whatsapp,
+    store,
+    config,
+    activeCustomerChatId: cust1,
+    mode: 'text',
+    turnId: 'turn-q-1',
+    nowMs: () => 1_800_000,
+  });
+  const staged = await execTextDraft('send_whatsapp_message', {
+    chatId: cust1,
+    recipientName: 'Ahmet Yılmaz',
+    messageText: 'Fiyatımız 5000 TL.',
+  });
+  assert.equal(staged.ok, false);
+  // Draft step must NOT clear queues yet
+  assert.ok(store.getPendingDelayedCall(cust1));
+  assert.equal(store.getQuietQueue().some((q) => q.chatId === cust1), true);
+
+  const execTextConfirm = createToolExecutor({
+    whatsapp,
+    store,
+    config,
+    activeCustomerChatId: cust1,
+    mode: 'text',
+    turnId: 'turn-q-2',
+    nowMs: () => 1_801_000,
+  });
+  const sentText = await execTextConfirm('send_whatsapp_message', {
+    chatId: cust1,
+    recipientName: 'Ahmet Yılmaz',
+    messageText: 'Fiyatımız 5000 TL.',
+    ownerConfirmed: true,
+  });
+  assert.equal(sentText.ok, true);
+  assert.equal(store.getPendingDelayedCall(cust1), null);
+  assert.equal(store.getQuietQueue().some((q) => q.chatId === cust1), false);
+
+  // Voice mode confirmed send also clears cust2's pendingDelayedCalls and quietQueue
+  const execVoice = createToolExecutor({
+    whatsapp,
+    store,
+    config,
+    activeCustomerChatId: cust2,
+    mode: 'voice',
+    nowMs: () => 1_802_000,
+  });
+  const sentVoice = await execVoice('send_whatsapp_message', {
+    chatId: cust2,
+    recipientName: 'Ayşe Demir',
+    messageText: 'Hemen iletiyorum efendim.',
+    ownerConfirmed: true,
+  });
+  assert.equal(sentVoice.ok, true);
+  assert.equal(store.getPendingDelayedCall(cust2), null);
+  assert.equal(store.getQuietQueue().some((q) => q.chatId === cust2), false);
 });

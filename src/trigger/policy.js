@@ -1,5 +1,6 @@
 import { phonesMatch } from '../utils/phone.js';
 import { formatMessageBody } from '../whatsapp/media-format.js';
+import { resolveCallSettings } from './settings.js';
 
 /**
  * Checks whether an incoming message belongs to a non-individual chat
@@ -193,128 +194,31 @@ export function evaluateIncomingMessage(event, deps = {}) {
     });
   }
 
-  // Active owner window: if owner replied to this chat within OWNER_ACTIVE_WINDOW_MINUTES, ignore completely
-  const ownerActiveWindowMs = (config.ownerActiveWindowMinutes ?? 15) * 60_000;
-  if (
-    typeof chatState.lastOwnerReplyAt === 'number' &&
-    nowMs - chatState.lastOwnerReplyAt >= 0 &&
-    nowMs - chatState.lastOwnerReplyAt < ownerActiveWindowMs
-  ) {
+  // Active owner window & call/cooldown suppression checks
+  const suppressionReason = evaluateCallSuppressionReason({
+    store,
+    chatState,
+    config,
+    callInProgress,
+    nowMs,
+  });
+  if (suppressionReason) {
     return {
-      action: 'ignore',
-      reason: 'owner_active_window',
+      action: suppressionReason === 'owner_active_window' ? 'ignore' : 'notify_only',
+      reason: suppressionReason,
       targetChatId,
       summaryText,
     };
   }
 
-  // Silence mode active
-  if (store && typeof store.isSilenced === 'function' && store.isSilenced(nowMs)) {
-    return {
-      action: 'notify_only',
-      reason: 'silenced',
-      targetChatId,
-      summaryText,
-    };
-  }
-
-  // Call in progress
-  if (callInProgress) {
+  const effectiveSettings = resolveCallSettings(config, store);
+  if (effectiveSettings.callPolicy === 'on_demand') {
     return {
       action: 'notify_only',
-      reason: 'call_in_progress',
+      reason: 'on_demand_policy',
       targetChatId,
       summaryText,
     };
-  }
-
-  // Third party outreach (e.g. supplier outreach via Jarvis)
-  if (
-    typeof chatState.thirdPartyOutreachUntil === 'number' &&
-    nowMs < chatState.thirdPartyOutreachUntil
-  ) {
-    return {
-      action: 'notify_only',
-      reason: 'third_party_outreach',
-      targetChatId,
-      summaryText,
-    };
-  }
-
-  // Voice AI disabled (text-only mode)
-  const voiceProvider = String(config?.aiVoice?.provider ?? config?.aiVoiceProvider ?? 'gemini')
-    .trim()
-    .toLowerCase();
-  if (voiceProvider === 'none') {
-    return {
-      action: 'notify_only',
-      reason: 'voice_disabled',
-      targetChatId,
-      summaryText,
-    };
-  }
-
-  // Cooldown and retry state machine
-  const cooldownMs = (config.cooldownMinutes ?? 120) * 60_000;
-  const missedRetryMs = (config.missedRetryMinutes ?? 30) * 60_000;
-  const lastTextReplyAt = chatState.lastTextReplyAt;
-  if (
-    typeof lastTextReplyAt === 'number' &&
-    nowMs - lastTextReplyAt >= 0 &&
-    nowMs - lastTextReplyAt < cooldownMs
-  ) {
-    return {
-      action: 'notify_only',
-      reason: 'recent_text_reply_cooldown',
-      targetChatId,
-      summaryText,
-    };
-  }
-  const lastCallAt = chatState.lastCallAt;
-  const lastCallStatus = chatState.lastCallStatus;
-  const missedRetryCount = chatState.missedRetryCount ?? 0;
-
-  if (lastCallStatus && typeof lastCallAt === 'number') {
-    const elapsed = nowMs - lastCallAt;
-
-    if (lastCallStatus === 'answered') {
-      if (elapsed < cooldownMs) {
-        return {
-          action: 'notify_only',
-          reason: 'answered_cooldown',
-          targetChatId,
-          summaryText,
-        };
-      }
-    } else if (lastCallStatus === 'rejected') {
-      if (elapsed < cooldownMs) {
-        return {
-          action: 'notify_only',
-          reason: 'rejected_cooldown',
-          targetChatId,
-          summaryText,
-        };
-      }
-    } else if (lastCallStatus === 'missed') {
-      if (elapsed < cooldownMs) {
-        if (missedRetryCount >= 1) {
-          return {
-            action: 'notify_only',
-            reason: 'missed_max_retries',
-            targetChatId,
-            summaryText,
-          };
-        }
-        if (elapsed < missedRetryMs) {
-          return {
-            action: 'notify_only',
-            reason: 'missed_retry_window',
-            targetChatId,
-            summaryText,
-          };
-        }
-      }
-    }
   }
 
   if (store && typeof store.setPendingCallChatId === 'function') {
@@ -325,8 +229,90 @@ export function evaluateIncomingMessage(event, deps = {}) {
     action: 'notify_and_call',
     targetChatId,
     summaryText,
-    reason: !lastCallStatus ? 'new_customer' : 'cooldown_expired_or_retry',
+    reason: !chatState?.lastCallStatus ? 'new_customer' : 'cooldown_expired_or_retry',
   };
+}
+
+/**
+ * Evaluates shared call-suppression and cooldown rules used by both immediate
+ * message evaluation and matured scheduled-call ticks.
+ *
+ * @param {object} [params={}]
+ * @returns {string|null} Suppression reason or `null` when calling is permitted
+ */
+export function evaluateCallSuppressionReason({
+  store = null,
+  chatState = {},
+  config = {},
+  callInProgress = false,
+  nowMs = Date.now(),
+} = {}) {
+  const safeState = chatState || {};
+  const ownerActiveWindowMs = (config.ownerActiveWindowMinutes ?? 15) * 60_000;
+  if (
+    typeof safeState.lastOwnerReplyAt === 'number' &&
+    nowMs - safeState.lastOwnerReplyAt >= 0 &&
+    nowMs - safeState.lastOwnerReplyAt < ownerActiveWindowMs
+  ) {
+    return 'owner_active_window';
+  }
+
+  if (store && typeof store.isSilenced === 'function' && store.isSilenced(nowMs)) {
+    return 'silenced';
+  }
+
+  if (callInProgress) {
+    return 'call_in_progress';
+  }
+
+  if (
+    typeof safeState.thirdPartyOutreachUntil === 'number' &&
+    nowMs < safeState.thirdPartyOutreachUntil
+  ) {
+    return 'third_party_outreach';
+  }
+
+  const voiceProvider = String(config?.aiVoice?.provider ?? config?.aiVoiceProvider ?? 'gemini')
+    .trim()
+    .toLowerCase();
+  if (voiceProvider === 'none') {
+    return 'voice_disabled';
+  }
+
+  const cooldownMs = (config.cooldownMinutes ?? 120) * 60_000;
+  const missedRetryMs = (config.missedRetryMinutes ?? 30) * 60_000;
+  const lastTextReplyAt = safeState.lastTextReplyAt;
+  if (
+    typeof lastTextReplyAt === 'number' &&
+    nowMs - lastTextReplyAt >= 0 &&
+    nowMs - lastTextReplyAt < cooldownMs
+  ) {
+    return 'recent_text_reply_cooldown';
+  }
+
+  const lastCallAt = safeState.lastCallAt;
+  const lastCallStatus = safeState.lastCallStatus;
+  const missedRetryCount = safeState.missedRetryCount ?? 0;
+
+  if (lastCallStatus && typeof lastCallAt === 'number') {
+    const elapsed = nowMs - lastCallAt;
+    if (lastCallStatus === 'answered' && elapsed < cooldownMs) {
+      return 'answered_cooldown';
+    }
+    if (lastCallStatus === 'rejected' && elapsed < cooldownMs) {
+      return 'rejected_cooldown';
+    }
+    if (lastCallStatus === 'missed' && elapsed < cooldownMs) {
+      if (missedRetryCount >= 1) {
+        return 'missed_max_retries';
+      }
+      if (elapsed < missedRetryMs) {
+        return 'missed_retry_window';
+      }
+    }
+  }
+
+  return null;
 }
 
 /**

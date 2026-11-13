@@ -831,3 +831,29 @@ test('review fixes: aiVoiceApiKey precedence, OpenAI ignores Gemini TTS_VOICE_NA
   rtSessionClosed.close();
   assert.equal(closedEvents, 1);
 });
+
+test('buildTextSystemInstruction documents call/quiet-hours settings and get/update_call_settings tools', () => {
+  const instr = buildTextSystemInstruction({
+    assistantName: 'Veko',
+    nowMs: Date.parse('2026-11-13T22:30:00+03:00'),
+    effectiveSettings: {
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: true,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '09:00',
+      quietHoursResumeMode: 'ask',
+      quietHoursAllowUrgent: false,
+    },
+    quietStatus: {
+      isQuietNow: true,
+      scheduledQuiet: true,
+      snoozeActive: false,
+      awaitingOwnerConfirm: false,
+    },
+  });
+  assert.match(instr, /get_call_settings/);
+  assert.match(instr, /update_call_settings/);
+  assert.match(instr, /22:00-09:00/);
+  assert.match(instr, /callPolicy=smart/i);
+});

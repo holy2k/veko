@@ -6,6 +6,13 @@ import path from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { normalizePhone, toWhatsAppId, phonesMatch } from '../src/utils/phone.js';
 import { createStateStore } from '../src/state/store.js';
+import {
+  resolveCallSettings,
+  isScheduledQuietAt,
+  evaluateQuietStatus,
+  computeIstanbulTimeTargetMs,
+  parseHhMm,
+} from '../src/trigger/settings.js';
 
 test('normalizePhone handles Turkish formats and WhatsApp JIDs', () => {
   assert.equal(normalizePhone('0532 111 22 33'), '905321112233');
@@ -258,7 +265,7 @@ test('review fixes: pendingOutgoingDraft and ownerChatHistory persist immediatel
 
 test('loadConfig reads appVersion, githubRepoUrl, and updateCheckUrl with overrides', () => {
   const def = loadConfig({ OWNER_PHONE: '05321112233', GEMINI_API_KEY: 'test-key' });
-  assert.equal(def.appVersion, '0.2.0');
+  assert.equal(def.appVersion, '0.2.1');
   assert.equal(def.githubRepoUrl, 'https://github.com/holy2k/veko');
   assert.equal(def.updateCheckUrl, 'https://raw.githubusercontent.com/holy2k/veko/main/package.json');
 
@@ -319,4 +326,176 @@ test('createStateStore defaults legacy update state and persists destructured up
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('loadConfig reads smart call policy, 10m delay, and quiet hours defaults/overrides', () => {
+  const def = loadConfig({ OWNER_PHONE: '05321112233', GEMINI_API_KEY: 'test-key' });
+  assert.equal(def.callPolicy, 'smart');
+  assert.equal(def.callDelayMinutes, 10);
+  assert.equal(def.quietHoursEnabled, false);
+  assert.equal(def.quietHoursStart, '22:00');
+  assert.equal(def.quietHoursEnd, '09:00');
+  assert.equal(def.quietHoursResumeMode, 'auto');
+  assert.equal(def.quietHoursAllowUrgent, false);
+
+  const implicitQuiet = loadConfig({
+    OWNER_PHONE: '05321112233',
+    GEMINI_API_KEY: 'test-key',
+    CALL_POLICY: 'on_demand',
+    CALL_DELAY_MINUTES: '3',
+    QUIET_HOURS_START: '23:30',
+    QUIET_HOURS_END: '08:30',
+    QUIET_HOURS_RESUME_MODE: 'ask',
+    QUIET_HOURS_ALLOW_URGENT: 'true',
+  });
+  assert.equal(implicitQuiet.callPolicy, 'on_demand');
+  assert.equal(implicitQuiet.callDelayMinutes, 3);
+  assert.equal(implicitQuiet.quietHoursEnabled, true);
+  assert.equal(implicitQuiet.quietHoursStart, '23:30');
+  assert.equal(implicitQuiet.quietHoursEnd, '08:30');
+  assert.equal(implicitQuiet.quietHoursResumeMode, 'ask');
+  assert.equal(implicitQuiet.quietHoursAllowUrgent, true);
+
+  const explicitDisabled = loadConfig({
+    OWNER_PHONE: '05321112233',
+    GEMINI_API_KEY: 'test-key',
+    QUIET_HOURS_ENABLED: 'false',
+    QUIET_HOURS_START: '22:00',
+    QUIET_HOURS_END: '09:00',
+  });
+  assert.equal(explicitDisabled.quietHoursEnabled, false);
+});
+
+test('createStateStore persists callSettings, pendingDelayedCalls, quietQueue, and quietScheduleState', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wpj-store-settings-'));
+  const file = path.join(tmpDir, 'state.json');
+  try {
+    const store = createStateStore(file);
+    const cfg = loadConfig({ OWNER_PHONE: '05321112233', GEMINI_API_KEY: 'test-key' });
+
+    store.setCallSettingsOverrides({
+      callDelayMinutes: 5,
+      quietHoursEnabled: true,
+      quietHoursStart: '21:00',
+      quietHoursEnd: '10:00',
+      quietHoursResumeMode: 'ask',
+      quietHoursAllowUrgent: true,
+    });
+    store.upsertPendingDelayedCall({
+      chatId: '905551110001@c.us',
+      customerName: 'Mehmet',
+      dueAtMs: 2_000_000,
+      firstMessageAt: 1_400_000,
+      lastMessageAt: 1_400_000,
+      messages: ['Fiyat alabilir miyim?'],
+      priority: 'normal',
+    });
+    store.enqueueQuietMessage({
+      chatId: '905551110002@c.us',
+      customerName: 'Ayşe',
+      phone: '905551110002',
+      priority: 'normal',
+      summary: 'Bilgi sordu',
+      latestMessage: 'Fiyat nedir?',
+      atMs: 1_500_000,
+    });
+    store.enqueueQuietMessage({
+      chatId: '905551110002@c.us',
+      customerName: 'Ayşe',
+      phone: '905551110002',
+      priority: 'urgent',
+      summary: 'Acil dönüş bekliyor',
+      latestMessage: 'Acil bilgi lütfen',
+      atMs: 1_600_000,
+    });
+    store.setQuietScheduleState({
+      lastMorningPromptYmd: '2026-11-13',
+      wasQuietPendingResume: true,
+      awaitingOwnerConfirm: true,
+      snoozedUntilMs: 3_000_000,
+      resumeConfirmedYmd: null,
+    });
+
+    const reloaded = createStateStore(file);
+    const resolved = resolveCallSettings(cfg, reloaded);
+    assert.equal(resolved.callPolicy, 'smart');
+    assert.equal(resolved.callDelayMinutes, 5);
+    assert.equal(resolved.quietHoursEnabled, true);
+    assert.equal(resolved.quietHoursStart, '21:00');
+    assert.equal(resolved.quietHoursEnd, '10:00');
+    assert.equal(resolved.quietHoursResumeMode, 'ask');
+    assert.equal(resolved.quietHoursAllowUrgent, true);
+
+    assert.equal(reloaded.getPendingDelayedCall('905551110001@c.us').customerName, 'Mehmet');
+    const q = reloaded.getQuietQueue();
+    assert.equal(q.length, 1);
+    assert.equal(q[0].messageCount, 2);
+    assert.equal(q[0].priority, 'urgent');
+    assert.equal(reloaded.getQuietScheduleState().awaitingOwnerConfirm, true);
+
+    reloaded.resetCallSettingsOverrides();
+    assert.equal(resolveCallSettings(cfg, reloaded).callDelayMinutes, 10);
+    assert.equal(resolveCallSettings(cfg, reloaded).quietHoursEnabled, false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('quiet hours evaluator handles Europe/Istanbul overnight, same-day, snooze, and morning confirm windows', () => {
+  assert.deepEqual(parseHhMm('09:30'), {
+    hour: 9,
+    minute: 30,
+    totalMinutes: 570,
+    formatted: '09:30',
+  });
+  assert.equal(parseHhMm('25:00'), null);
+
+  const settings = {
+    quietHoursEnabled: true,
+    quietHoursStart: '22:00',
+    quietHoursEnd: '09:00',
+    quietHoursResumeMode: 'ask',
+  };
+  // 2026-11-13 22:30 Istanbul == 19:30 UTC
+  const nightMs = Date.UTC(2026, 10, 13, 19, 30, 0);
+  // 2026-11-14 08:59 Istanbul == 05:59 UTC
+  const earlyMorningMs = Date.UTC(2026, 10, 14, 5, 59, 0);
+  // 2026-11-14 09:00 Istanbul == 06:00 UTC
+  const nineAmMs = Date.UTC(2026, 10, 14, 6, 0, 0);
+  // 2026-11-14 14:00 Istanbul == 11:00 UTC
+  const afternoonMs = Date.UTC(2026, 10, 14, 11, 0, 0);
+
+  assert.equal(isScheduledQuietAt(settings, nightMs), true);
+  assert.equal(isScheduledQuietAt(settings, earlyMorningMs), true);
+  assert.equal(isScheduledQuietAt(settings, nineAmMs), false);
+
+  // Same-day window 13:00 - 15:00
+  const midday = { quietHoursEnabled: true, quietHoursStart: '13:00', quietHoursEnd: '15:00' };
+  assert.equal(isScheduledQuietAt(midday, afternoonMs), true);
+  assert.equal(isScheduledQuietAt(midday, nineAmMs), false);
+
+  // Enabling at 14:00 without prior quiet session does NOT emit morning prompt
+  const noSpurious = evaluateQuietStatus(
+    settings,
+    { wasQuietPendingResume: false, lastMorningPromptYmd: null, awaitingOwnerConfirm: false },
+    afternoonMs,
+    0
+  );
+  assert.equal(noSpurious.isQuietNow, false);
+  assert.equal(noSpurious.shouldSendMorningPrompt, false);
+
+  // Transition at 09:00 after quiet session emits morning prompt once
+  const morningDue = evaluateQuietStatus(
+    settings,
+    { wasQuietPendingResume: true, lastMorningPromptYmd: '2026-11-13', awaitingOwnerConfirm: false },
+    nineAmMs,
+    0
+  );
+  assert.equal(morningDue.isQuietNow, false);
+  assert.equal(morningDue.shouldSendMorningPrompt, true);
+  assert.equal(morningDue.todayYmd, '2026-11-14');
+
+  // Target Istanbul HH:MM solver
+  const target1030 = computeIstanbulTimeTargetMs('10:30', nineAmMs);
+  assert.equal(target1030, Date.UTC(2026, 10, 14, 7, 30, 0));
 });

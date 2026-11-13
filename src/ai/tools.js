@@ -1,4 +1,10 @@
 import { Type } from '@google/genai';
+import {
+  resolveCallSettings,
+  validateSettingsPatch,
+  computeIstanbulTimeTargetMs,
+  evaluateQuietStatus,
+} from '../trigger/settings.js';
 import { formatMessageBody } from '../whatsapp/media-format.js';
 import { normalizePhone, phonesMatch, stripJidDeviceTag, toWhatsAppId } from '../utils/phone.js';
 import {
@@ -108,6 +114,73 @@ export const TOOL_DECLARATIONS = [
         },
       },
       required: ['enabled'],
+    },
+  },
+  {
+    name: 'get_call_settings',
+    description:
+      'Returns current call policy, debounce delay, quiet hours schedule, morning resume confirmation status, pending delayed calls count, and quiet queue count.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {},
+    },
+  },
+  {
+    name: 'update_call_settings',
+    description:
+      'Updates Veko call policy, 10-minute debounce delay, quiet hours schedule, morning resume confirmation, or snooze duration at runtime.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        callPolicy: {
+          type: Type.STRING,
+          description: 'Call policy mode: "smart", "always", or "on_demand".',
+        },
+        callDelayMinutes: {
+          type: Type.NUMBER,
+          description: 'Debounce delay in minutes (0 to 180) before calling on normal messages in smart mode.',
+        },
+        quietHoursEnabled: {
+          type: Type.BOOLEAN,
+          description: 'Whether quiet hours suppression is enabled.',
+        },
+        quietHoursStart: {
+          type: Type.STRING,
+          description: 'Quiet hours start time in 24h Europe/Istanbul HH:MM format (e.g., "22:00").',
+        },
+        quietHoursEnd: {
+          type: Type.STRING,
+          description: 'Quiet hours end time in 24h Europe/Istanbul HH:MM format (e.g., "09:00").',
+        },
+        quietHoursResumeMode: {
+          type: Type.STRING,
+          description: 'Morning exit behavior: "auto" (automatic digest) or "ask" (ask owner confirmation first).',
+        },
+        quietHoursAllowUrgent: {
+          type: Type.BOOLEAN,
+          description: 'If true, critical emergencies can wake the owner even during quiet hours.',
+        },
+        confirmMorningResume: {
+          type: Type.BOOLEAN,
+          description: 'Set true when the owner confirms starting work/resuming calls after quiet hours.',
+        },
+        snoozeMinutes: {
+          type: Type.NUMBER,
+          description: 'Temporarily pause calls and digest for N minutes from now (1 to 720), queueing incoming items.',
+        },
+        snoozeUntilTime: {
+          type: Type.STRING,
+          description: 'Temporarily pause calls and digest until an Istanbul HH:MM time (e.g., "10:30").',
+        },
+        clearSnooze: {
+          type: Type.BOOLEAN,
+          description: 'Set true to cancel an active snooze immediately.',
+        },
+        resetToEnvDefaults: {
+          type: Type.BOOLEAN,
+          description: 'Set true to clear all WhatsApp runtime overrides and revert to .env defaults.',
+        },
+      },
     },
   },
   {
@@ -276,6 +349,7 @@ export function createToolExecutor({
   nowMs = () => Date.now(),
   fetchImpl = globalThis.fetch,
   onEndCallRequested,
+  onDelayCleared,
 } = {}) {
   const isTextMode = mode === 'text';
   const effectiveTurnId = String(turnId || `auto-turn-${++autoTurnCounter}`).trim();
@@ -283,6 +357,111 @@ export function createToolExecutor({
     typeof nowMs === 'function'
       ? nowMs
       : () => (Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now());
+
+  function buildSettingsSnapshot(now) {
+    const effective = resolveCallSettings(config, store);
+    const overrides = store?.getCallSettingsOverrides?.() || {};
+    const scheduleState = store?.getQuietScheduleState?.() || {};
+    const quietQueue = store?.getQuietQueue?.() || [];
+    const pendingDelayed = store?.getPendingDelayedCalls?.() || {};
+    const quietStatus = evaluateQuietStatus(effective, scheduleState, now, quietQueue.length);
+
+    return {
+      settings: effective,
+      overrides,
+      quietStatus: {
+        ...quietStatus,
+        snoozedUntilIso: scheduleState?.snoozedUntilMs
+          ? formatTimestampToIstanbulIso(Math.floor(scheduleState.snoozedUntilMs / 1000))
+          : null,
+      },
+      pendingDelayedCount: Object.keys(pendingDelayed).length,
+      quietQueueCount: quietQueue.length,
+    };
+  }
+
+  function handleGetCallSettings() {
+    return {
+      ok: true,
+      ...buildSettingsSnapshot(getNowMs()),
+    };
+  }
+
+  function handleUpdateCallSettings(args = {}) {
+    const now = getNowMs();
+    const patchCheck = validateSettingsPatch(args);
+    if (!patchCheck.ok) {
+      return { ok: false, error: patchCheck.error };
+    }
+
+    let nextSnoozeMs = null;
+    if ('snoozeUntilTime' in args && args.snoozeUntilTime !== undefined) {
+      const targetMs = computeIstanbulTimeTargetMs(String(args.snoozeUntilTime), now);
+      if (!targetMs) {
+        return { ok: false, error: 'snoozeUntilTime geçerli bir HH:MM (ör. 10:30) saati olmalıdır.' };
+      }
+      nextSnoozeMs = targetMs;
+    } else if ('snoozeMinutes' in args && args.snoozeMinutes !== undefined) {
+      const mins = Number(args.snoozeMinutes);
+      if (!Number.isFinite(mins) || mins <= 0 || mins > 720) {
+        return { ok: false, error: 'snoozeMinutes 1 ile 720 dakika arasında olmalıdır.' };
+      }
+      nextSnoozeMs = now + Math.round(mins * 60_000);
+    }
+
+    if (args.resetToEnvDefaults === true) {
+      store?.resetCallSettingsOverrides?.();
+    }
+    if (Object.keys(patchCheck.patch).length > 0) {
+      store?.setCallSettingsOverrides?.(patchCheck.patch);
+      if (patchCheck.patch.quietHoursEnabled === false) {
+        store?.setQuietScheduleState?.({
+          awaitingOwnerConfirm: false,
+          wasQuietPendingResume: false,
+        });
+      }
+    }
+
+    if (args.clearSnooze === true) {
+      store?.setQuietScheduleState?.({
+        snoozedUntilMs: null,
+        pendingSnoozeDigest: false,
+      });
+    } else if (nextSnoozeMs !== null) {
+      store?.setQuietScheduleState?.({
+        snoozedUntilMs: nextSnoozeMs,
+        pendingSnoozeDigest: true,
+        awaitingOwnerConfirm: false,
+        resumeConfirmedYmd: null,
+      });
+    }
+
+    let confirmedMorningResume = false;
+    let flushedQuietMessages = [];
+    if (args.confirmMorningResume === true) {
+      const snapBefore = buildSettingsSnapshot(now);
+      const todayYmd = snapBefore.quietStatus.todayYmd;
+      flushedQuietMessages = store?.clearQuietQueue?.() || [];
+      store?.setQuietScheduleState?.({
+        awaitingOwnerConfirm: false,
+        wasQuietPendingResume: false,
+        snoozedUntilMs: null,
+        pendingSnoozeDigest: false,
+        resumeConfirmedYmd: todayYmd,
+        lastMorningPromptYmd: todayYmd,
+      });
+      confirmedMorningResume = true;
+    }
+
+    return {
+      ok: true,
+      confirmedMorningResume,
+      flushedQuietQueueCount: flushedQuietMessages.length,
+      flushedQuietMessages,
+      ...buildSettingsSnapshot(now),
+    };
+  }
+
   async function handleGetChatHistory(args = {}) {
     const chatId = resolveChatId(args.chatIdOrPhone);
     if (!chatId || isUnsupportedChatId(chatId)) {
@@ -493,6 +672,26 @@ export function createToolExecutor({
       }
     }
 
+    if (!isOwnerTarget && !effectiveIsThirdParty) {
+      const delayedMap = store?.getPendingDelayedCalls?.() || {};
+      for (const key of Object.keys(delayedMap)) {
+        if (key === targetChatId || isSameChatIdentity(key, targetChatId)) {
+          store?.removePendingDelayedCall?.(key);
+          onDelayCleared?.(key);
+        }
+      }
+      const quietItems = store?.getQuietQueue?.() || [];
+      for (const item of quietItems) {
+        if (
+          item?.chatId &&
+          (item.chatId === targetChatId || isSameChatIdentity(item.chatId, targetChatId))
+        ) {
+          store?.removeQuietQueueItem?.(item.chatId);
+        }
+      }
+      onDelayCleared?.(targetChatId);
+    }
+
     let auditMessageId = null;
     let auditSent = false;
     let auditError;
@@ -668,6 +867,10 @@ export function createToolExecutor({
         return handleGetCustomerStats(safeArgs);
       case 'clear_pending_draft':
         return handleClearPendingDraft();
+      case 'get_call_settings':
+        return handleGetCallSettings();
+      case 'update_call_settings':
+        return handleUpdateCallSettings(safeArgs);
       case 'set_update_notifications':
         return handleSetUpdateNotifications(safeArgs);
       case 'check_for_updates':

@@ -1,5 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { TEXT_TOOL_DECLARATIONS, createToolExecutor } from './tools.js';
+import { resolveCallSettings, evaluateQuietStatus } from '../trigger/settings.js';
 import { resolveStyleProfile, sanitizeSingleLineField } from './live-session.js';
 import { geminiSchemaToJsonSchema, parseToolArgs } from './openai-realtime.js';
 
@@ -40,6 +41,8 @@ export function buildTextSystemInstruction({
   assistantStyle = '',
   nowMs = Date.now(),
   pendingDraft = null,
+  effectiveSettings = null,
+  quietStatus = null,
 } = {}) {
   const safeName = cleanField(assistantName, 'Veko', 40);
   const { systemLine } = resolveStyleProfile({ assistantStyle }, safeName);
@@ -64,8 +67,20 @@ export function buildTextSystemInstruction({
     '  2. Patron onayladığında (onay turunda) `send_whatsapp_message` çağırırken `chatId` ve `messageText` değerlerini taslaktakiyle HARFİ HARFİNE aynı gönder ve `ownerConfirmed: true` ver.',
     '  3. Patron vazgeçer, reddeder veya bekleyen taslağı onaylamadan bambaşka bir konuya geçerse `clear_pending_draft` aracını çağırarak eski taslağı temizle.',
     '- Patron güncelleme bildirimlerini açmak/kapatmak isterse ("güncelleme bildirimi kapat/aç", "artık sürüm mesajı atma" vb.) `set_update_notifications` aracını, yeni sürüm kontrolü isterse `check_for_updates` aracını kullan.',
+    '- Patron arama politikası, bekleme süresi (debounce) veya mesai dışı / sessiz saatler ("mesai 9da başlasın", "gece 11den sonra arama", "bekleme 5 dakika olsun", "mesaiyi başlat", "10:30a ertele", "sadece çok acilde ara", "ayarlar nasıl") sorduğunda veya değiştirmek istediğinde `get_call_settings` / `update_call_settings` araçlarını kullan. Sabah mesai onayı beklerken patron onay verirse `confirmMorningResume: true` çağır ve dönen `flushedQuietMessages` özetlerini paylaş.',
     '- Yanıtları telefonda kolay okunacak şekilde kısa, net ve düzenli tut.',
   ];
+  if (effectiveSettings) {
+    lines.push(
+      '',
+      '<ARAMA_VE_MESAI_AYARLARI>',
+      `- callPolicy=${effectiveSettings.callPolicy}, callDelayMinutes=${effectiveSettings.callDelayMinutes}, quietHours=${effectiveSettings.quietHoursEnabled ? `${effectiveSettings.quietHoursStart}-${effectiveSettings.quietHoursEnd}` : 'kapalı'}, resumeMode=${effectiveSettings.quietHoursResumeMode}, allowUrgent=${Boolean(effectiveSettings.quietHoursAllowUrgent)}.`,
+      quietStatus
+        ? `- Şu an sessiz mod=${Boolean(quietStatus.isQuietNow)}, onayBekleniyor=${Boolean(quietStatus.awaitingOwnerConfirm)}, ertelemeAktif=${Boolean(quietStatus.snoozeActive)}.`
+        : '- Şu an durum kontrolü için get_call_settings kullan.',
+      '</ARAMA_VE_MESAI_AYARLARI>'
+    );
+  }
 
   if (pendingDraft && pendingDraft.chatId && pendingDraft.messageText) {
     lines.push(
@@ -432,11 +447,21 @@ export async function runOwnerTextTurn(
   }
 
   const pendingDraft = store?.getPendingOutgoingDraft?.(now) || null;
+  const effectiveSettings = resolveCallSettings(config, store);
+  const quietQueue = store?.getQuietQueue?.() || [];
+  const quietStatus = evaluateQuietStatus(
+    effectiveSettings,
+    store?.getQuietScheduleState?.() || {},
+    now,
+    quietQueue.length
+  );
   const systemInstruction = buildTextSystemInstruction({
     assistantName: config.assistantName || 'Veko',
     assistantStyle: config.assistantStyle || '',
     nowMs: now,
     pendingDraft,
+    effectiveSettings,
+    quietStatus,
   });
 
   const history = store?.getOwnerChatHistory?.() || [];
@@ -452,6 +477,7 @@ export async function runOwnerTextTurn(
       turnId,
       nowMs: getNow,
       ...(deps.fetch ? { fetchImpl: deps.fetch } : {}),
+      ...(deps.onDelayCleared ? { onDelayCleared: deps.onDelayCleared } : {}),
     });
 
   try {
@@ -492,5 +518,164 @@ export async function runOwnerTextTurn(
       error: err?.message || 'AI text error',
       text: FALLBACK_ERROR_REPLY,
     };
+  }
+}
+
+/**
+ * Generates a single non-tool text completion across the configured text AI protocol
+ * (`gemini`, `openai-compatible`, or `anthropic`). Used by lightweight background helpers
+ * such as message triage without duplicating provider transport/auth logic.
+ *
+ * @param {object} params
+ * @param {object} [params.config={}]
+ * @param {string} [params.systemInstruction='']
+ * @param {string} [params.userPrompt='']
+ * @param {number} [params.timeoutMs=8000]
+ * @param {number} [params.maxTokens=350]
+ * @param {object} [deps={}]
+ * @returns {Promise<{ ok: boolean, text: string, disabled?: boolean, error?: string }>}
+ */
+export async function generateTextCompletion(
+  {
+    config = {},
+    systemInstruction = '',
+    userPrompt = '',
+    timeoutMs = 8000,
+    maxTokens = 350,
+  } = {},
+  deps = {}
+) {
+  const textCfg = normalizeTextConfig(config);
+  if (textCfg.provider === 'none' || textCfg.protocol === 'none') {
+    return { ok: false, disabled: true, text: '' };
+  }
+
+  const prompt = String(userPrompt || '').trim();
+  if (!prompt) {
+    return { ok: false, error: 'Empty prompt', text: '' };
+  }
+
+  try {
+    if (textCfg.protocol === 'gemini') {
+      if (!textCfg.apiKey) {
+        return { ok: false, disabled: true, error: 'Missing GEMINI_API_KEY', text: '' };
+      }
+      const GoogleGenAIImpl = deps.GoogleGenAI || GoogleGenAI;
+      const ai = new GoogleGenAIImpl({ apiKey: textCfg.apiKey });
+      const effectiveTimeoutMs =
+        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : 8000;
+      const controller = new AbortController();
+      let timeoutId = null;
+      let response;
+      try {
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            const timeoutErr = new Error(`Text AI request timed out after ${effectiveTimeoutMs}ms`);
+            controller.abort(timeoutErr);
+            reject(timeoutErr);
+          }, effectiveTimeoutMs);
+          timeoutId.unref?.();
+        });
+        response = await Promise.race([
+          ai.models.generateContent({
+            model: textCfg.model,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: {
+              ...(systemInstruction ? { systemInstruction } : {}),
+              maxOutputTokens: maxTokens,
+              abortSignal: controller.signal,
+            },
+          }),
+          timeoutPromise,
+        ]);
+      } finally {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+      }
+      const parts = response?.candidates?.[0]?.content?.parts;
+      const partsText = Array.isArray(parts)
+        ? parts
+            .filter((p) => typeof p?.text === 'string' && !p?.thought)
+            .map((p) => p.text)
+            .join('')
+            .trim()
+        : '';
+      const finalText = partsText || String(response?.text || '').trim();
+      return { ok: Boolean(finalText), text: finalText };
+    }
+
+    const fetchImpl = deps.fetch || globalThis.fetch;
+    if (typeof fetchImpl !== 'function') {
+      return { ok: false, error: 'Global fetch is unavailable.', text: '' };
+    }
+
+    if (textCfg.protocol === 'openai-compatible') {
+      const baseUrl = String(textCfg.baseUrl || '').replace(/\/+$/, '');
+      if (!baseUrl) {
+        return { ok: false, error: `Missing baseUrl for ${textCfg.provider}`, text: '' };
+      }
+      const headers = {
+        'Content-Type': 'application/json',
+        ...(textCfg.extraHeaders && typeof textCfg.extraHeaders === 'object' ? textCfg.extraHeaders : {}),
+        ...(textCfg.apiKey ? { Authorization: `Bearer ${textCfg.apiKey}` } : {}),
+      };
+      const resp = await fetchImpl(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: textCfg.model,
+          max_tokens: maxTokens,
+          messages: [
+            ...(systemInstruction ? [{ role: 'system', content: systemInstruction }] : []),
+            { role: 'user', content: prompt },
+          ],
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) {
+        return { ok: false, error: `HTTP ${resp.status}`, text: '' };
+      }
+      const data = await resp.json();
+      const text = String(data?.choices?.[0]?.message?.content || '').trim();
+      return { ok: Boolean(text), text };
+    }
+
+    if (textCfg.protocol === 'anthropic') {
+      if (!textCfg.apiKey) {
+        return { ok: false, disabled: true, error: 'Missing ANTHROPIC_API_KEY', text: '' };
+      }
+      const baseUrl = String(textCfg.baseUrl || 'https://api.anthropic.com').replace(/\/+$/, '');
+      const resp = await fetchImpl(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': textCfg.apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: textCfg.model,
+          max_tokens: maxTokens,
+          ...(systemInstruction ? { system: systemInstruction } : {}),
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) {
+        return { ok: false, error: `HTTP ${resp.status}`, text: '' };
+      }
+      const data = await resp.json();
+      const blocks = Array.isArray(data?.content) ? data.content : [];
+      const text = blocks
+        .filter((b) => b?.type === 'text' && typeof b?.text === 'string')
+        .map((b) => b.text)
+        .join('')
+        .trim();
+      return { ok: Boolean(text), text };
+    }
+
+    return { ok: false, error: `Unsupported protocol: ${textCfg.protocol}`, text: '' };
+  } catch (err) {
+    return { ok: false, error: err?.message || 'Completion failed', text: '' };
   }
 }

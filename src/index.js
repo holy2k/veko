@@ -4,12 +4,24 @@ import { pathToFileURL } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import { loadConfig } from './config.js';
 import { createStateStore } from './state/store.js';
-import { evaluateIncomingMessage, evaluateIncomingCall } from './trigger/policy.js';
+import {
+  evaluateIncomingMessage,
+  evaluateIncomingCall,
+  evaluateCallSuppressionReason,
+} from './trigger/policy.js';
 import { createWhatsAppClient } from './whatsapp/client.js';
 import { createCallController } from './whatsapp/call-controller.js';
 import { startVoiceSession } from './ai/voice-session.js';
 import { runOwnerTextTurn } from './ai/text-chat.js';
-import { createToolExecutor } from './ai/tools.js';
+import { createToolExecutor, isSameChatIdentity } from './ai/tools.js';
+import { normalizeTurkishText } from './utils/text.js';
+import { triageCustomerMessage } from './ai/triage.js';
+import {
+  resolveCallSettings,
+  evaluateQuietStatus,
+  formatQuietDigestMessage,
+  computeIstanbulTimeTargetMs,
+} from './trigger/settings.js';
 import {
   DEFAULT_GITHUB_REPO_URL,
   UPDATE_CHECK_CACHE_TTL_MS,
@@ -24,18 +36,7 @@ const MAX_WHATSAPP_CHUNK_CHARS = 3500;
 const STARTUP_NOTICE_COOLDOWN_MS = 15 * 60_000;
 
 function normalizeUpdateTogglePhrase(text) {
-  return String(text || '')
-    .replace(/İ/g, 'i')
-    .toLowerCase()
-    .replace(/\u0307/g, '')
-    .replace(/ı/g, 'i')
-    .replace(/ğ/g, 'g')
-    .replace(/ü/g, 'u')
-    .replace(/ş/g, 's')
-    .replace(/ö/g, 'o')
-    .replace(/ç/g, 'c')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return normalizeTurkishText(text);
 }
 
 function splitTextIntoChunks(text, maxLen = MAX_WHATSAPP_CHUNK_CHARS) {
@@ -131,12 +132,95 @@ export function createOrchestrator({
   runTextTurn = runOwnerTextTurn,
   createTools = createToolExecutor,
   fetchImpl = null,
+  triageMessage = triageCustomerMessage,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
   nowFn = () => Date.now(),
 }) {
   let callRunning = false;
   let ownerChatQueue = Promise.resolve();
   let ownerTurnSeq = 0;
   let startupHandled = false;
+  const activeDelayTimers = new Map();
+  let scheduleRunChain = Promise.resolve();
+
+  function clearDelayTimerForChat(chatId) {
+    const handle = activeDelayTimers.get(chatId);
+    if (handle) {
+      try {
+        clearTimeoutFn(handle);
+      } catch {
+        // Ignore timer cleanup errors
+      }
+      activeDelayTimers.delete(chatId);
+    }
+  }
+
+  function getPendingDelayedByIdentity(chatId) {
+    if (!chatId) return null;
+    const direct = store.getPendingDelayedCall?.(chatId);
+    if (direct) return direct;
+    const all = store.getPendingDelayedCalls?.() || {};
+    for (const [key, entry] of Object.entries(all)) {
+      if (isSameChatIdentity(key, chatId)) {
+        return entry;
+      }
+    }
+    return null;
+  }
+
+  function clearQuietQueueForChat(chatId) {
+    if (!chatId) return;
+    store.removeQuietQueueItem?.(chatId);
+    for (const item of store.getQuietQueue?.() || []) {
+      if (item?.chatId && (item.chatId === chatId || isSameChatIdentity(item.chatId, chatId))) {
+        store.removeQuietQueueItem?.(item.chatId);
+      }
+    }
+  }
+
+  function cancelPendingDelayedCall(chatId) {
+    if (!chatId) return;
+    clearDelayTimerForChat(chatId);
+    store.removePendingDelayedCall?.(chatId);
+    for (const key of Object.keys(store.getPendingDelayedCalls?.() || {})) {
+      if (isSameChatIdentity(key, chatId)) {
+        clearDelayTimerForChat(key);
+        store.removePendingDelayedCall?.(key);
+      }
+    }
+  }
+
+  function buildMergedSummary(priorMessages = [], currentText = '') {
+    const items = [];
+    for (const msgText of priorMessages) {
+      const trimmed = String(msgText || '').trim();
+      if (trimmed) items.push(trimmed);
+    }
+    const curr = String(currentText || '').trim();
+    if (curr && items[items.length - 1] !== curr) {
+      items.push(curr);
+    }
+    if (items.length === 0) return curr;
+    if (items.length === 1) return items[0];
+    return `(${items.length} mesaj) ${items.join(' | ')}`;
+  }
+
+  function armDelayTimer(chatId, dueAtMs) {
+    if (!chatId || !Number.isFinite(dueAtMs)) return;
+    clearDelayTimerForChat(chatId);
+    const delayMs = Math.min(Math.max(0, dueAtMs - nowFn()), 2_147_483_647);
+    const handle = setTimeoutFn(() => {
+      activeDelayTimers.delete(chatId);
+      Promise.resolve(processScheduledEvents()).catch((err) => {
+        console.error('[orchestrator] scheduled timer failed:', err?.message || err);
+      });
+    }, delayMs);
+    if (handle && typeof handle.unref === 'function') {
+      handle.unref();
+    }
+    activeDelayTimers.set(chatId, handle);
+  }
 
   function isVoiceDisabled() {
     const provider = String(config?.aiVoice?.provider ?? config?.aiVoiceProvider ?? 'gemini')
@@ -463,6 +547,7 @@ export function createOrchestrator({
           config,
           activeCustomerChatId,
           ...(fetchImpl ? { fetchImpl } : {}),
+          onDelayCleared: clearDelayTimerForChat,
           onEndCallRequested: () => requestCallHangup('end_call_tool'),
         });
 
@@ -575,6 +660,11 @@ export function createOrchestrator({
     if (callRunning || callController.isCallActive?.()) {
       await sendOwnerNotice(`📞 Zaten aktif bir arama var — ${customerName}: "${triggerBody}"`);
       return 'skipped';
+    }
+
+    if (targetChatId) {
+      cancelPendingDelayedCall(targetChatId);
+      clearQuietQueueForChat(targetChatId);
     }
 
     try {
@@ -709,11 +799,33 @@ export function createOrchestrator({
         updateState.cachedLatestVersion &&
           isNewerVersion(updateState.cachedLatestVersion, currentVersion)
       );
+      const effectiveSettings = resolveCallSettings(config, store);
+      const quietQueue = store.getQuietQueue?.() || [];
+      const quietStatus = evaluateQuietStatus(
+        effectiveSettings,
+        store.getQuietScheduleState?.() || {},
+        now,
+        quietQueue.length
+      );
+      const pendingDelayedCount = Object.keys(store.getPendingDelayedCalls?.() || {}).length;
+      const quietDetails = effectiveSettings.quietHoursEnabled
+        ? `${effectiveSettings.quietHoursStart}-${effectiveSettings.quietHoursEnd} (${effectiveSettings.quietHoursResumeMode}, Kuyruk: ${quietQueue.length}${
+            quietStatus.awaitingOwnerConfirm
+              ? ', Onay Bekleniyor'
+              : quietStatus.snoozeActive
+                ? ', Ertelendi'
+                : quietStatus.isQuietNow
+                  ? ', Sessiz Mod Aktif'
+                  : ''
+          })`
+        : 'Kapalı';
       await sendOwnerNotice(
         [
           `📊 ${assistantName} Durum: ${silenced ? 'Susturulmuş (sessiz bildirim)' : 'Aktif'}`,
           `📞 Aktif Arama: ${activeCall ? 'Var' : 'Yok'}`,
           `⏳ Bekleyen Arama: ${pending || 'Yok'}`,
+          `🎛️ Arama Modu: ${effectiveSettings.callPolicy} (Gecikme: ${effectiveSettings.callDelayMinutes} dk, Bekleyen: ${pendingDelayedCount})`,
+          `🌙 Mesai Dışı: ${quietDetails}`,
           `📦 Sürüm: v${currentVersion}`,
           `🔔 Güncelleme Bildirimi: ${notifEnabled ? 'Açık' : 'Kapalı'}${hasNewCached ? ` (Yeni: v${updateState.cachedLatestVersion})` : ''}`,
         ].join('\n')
@@ -806,6 +918,57 @@ export function createOrchestrator({
         await sendOwnerNotice('🔔 Güncelleme bildirimleri açıldı.');
         return { ...decision, updateNotificationsEnabled: true };
       }
+
+      const now = nowFn();
+      const settings = resolveCallSettings(config, store);
+      const scheduleState = store.getQuietScheduleState?.() || {};
+      const quietQueue = store.getQuietQueue?.() || [];
+      const quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
+      if (quietStatus.awaitingOwnerConfirm) {
+        if (/^(evet|baslasin|baslat|tamam|olur|onay|ac|basla)$/.test(normalizedCmd)) {
+          const queued = store.clearQuietQueue?.() || [];
+          store.setQuietScheduleState?.({
+            awaitingOwnerConfirm: false,
+            wasQuietPendingResume: false,
+            snoozedUntilMs: null,
+            pendingSnoozeDigest: false,
+            resumeConfirmedYmd: quietStatus.todayYmd,
+            lastMorningPromptYmd: quietStatus.todayYmd,
+          });
+          if (queued.length > 0) {
+            const digestText = formatQuietDigestMessage(queued, {
+              header: `✅ Mesai başlatıldı! Gece/mesai dışı bekleyen mesajlar (${queued.length}):`,
+            });
+            await sendOwnerNotice(digestText);
+            appendSystemNoticeToHistory(digestText);
+          } else {
+            await sendOwnerNotice('✅ Mesai başlatıldı. Yeni aramalar aktif.');
+          }
+          return { ...decision, action: 'owner_chat', reason: 'morning_resume_confirmed_fallback' };
+        }
+        const timeMatch = /^(\d{1,2}:\d{2})/.exec(normalizedCmd);
+        const minsMatch = /^(\d{1,3})\s*(dk|dakika)\s*(ertele|sonra)?/.exec(normalizedCmd);
+        let snoozedUntilMs = null;
+        if (timeMatch) {
+          snoozedUntilMs = computeIstanbulTimeTargetMs(timeMatch[1], now);
+        } else if (minsMatch) {
+          const mins = Number(minsMatch[1]);
+          if (Number.isFinite(mins) && mins > 0 && mins <= 720) {
+            snoozedUntilMs = now + mins * 60_000;
+          }
+        }
+        if (snoozedUntilMs) {
+          store.setQuietScheduleState?.({
+            snoozedUntilMs,
+            pendingSnoozeDigest: true,
+            awaitingOwnerConfirm: false,
+            resumeConfirmedYmd: null,
+          });
+          await sendOwnerNotice('⏰ Mesai erteleme ayarlandı. Süre bitince bekleyen özet iletilecek.');
+          return { ...decision, action: 'owner_chat', reason: 'morning_snooze_fallback' };
+        }
+      }
+
       return {
         ...decision,
         action: 'ignore',
@@ -832,7 +995,10 @@ export function createOrchestrator({
           turnId,
           nowMs: nowFn,
         },
-        ...(fetchImpl ? [{ fetch: fetchImpl }] : [])
+        {
+          ...(fetchImpl ? { fetch: fetchImpl } : {}),
+          onDelayCleared: clearDelayTimerForChat,
+        }
       );
 
       if (reply?.disabled) {
@@ -857,16 +1023,183 @@ export function createOrchestrator({
     return queuedTurn;
   }
 
+  async function runScheduledTick(overrideNowMs) {
+    const now = Number.isFinite(overrideNowMs) ? overrideNowMs : nowFn();
+    const settings = resolveCallSettings(config, store);
+    let scheduleState = store.getQuietScheduleState?.() || {};
+    let quietQueue = store.getQuietQueue?.() || [];
+    let quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
+
+    if (quietStatus.scheduledQuiet && !scheduleState.wasQuietPendingResume) {
+      scheduleState =
+        store.setQuietScheduleState?.({
+          wasQuietPendingResume: true,
+          ...(scheduleState.resumeConfirmedYmd === quietStatus.todayYmd
+            ? {}
+            : { resumeConfirmedYmd: null }),
+        }) || scheduleState;
+      quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
+    }
+
+    if (quietStatus.shouldSendMorningPrompt) {
+      if (settings.quietHoursResumeMode === 'ask') {
+        const countLine =
+          quietQueue.length > 0
+            ? `\nGece/mesai dışında ${quietQueue.length} bekleyen müşteri mesajı birikti.`
+            : '';
+        const askText =
+          `☀️ Günaydın! Saat ${quietStatus.hhMm} oldu, mesai başlasın mı?${countLine}\n` +
+          'Başlatmak için "evet" / "başlasın", ertelemek için ör. "30 dk ertele" veya "10:30" yazabilirsiniz.';
+        await sendOwnerNotice(askText);
+        appendSystemNoticeToHistory(askText);
+        store.setQuietScheduleState?.({
+          lastMorningPromptYmd: quietStatus.todayYmd,
+          awaitingOwnerConfirm: true,
+          wasQuietPendingResume: false,
+        });
+      } else {
+        if (quietQueue.length > 0) {
+          const digestText = formatQuietDigestMessage(quietQueue, {
+            header: `☀️ Günaydın! Gece/mesai dışı bekleyen mesajlar (${quietQueue.length}):`,
+          });
+          await sendOwnerNotice(digestText);
+          appendSystemNoticeToHistory(digestText);
+          store.clearQuietQueue?.();
+        }
+        store.setQuietScheduleState?.({
+          lastMorningPromptYmd: quietStatus.todayYmd,
+          awaitingOwnerConfirm: false,
+          wasQuietPendingResume: false,
+          pendingSnoozeDigest: false,
+          resumeConfirmedYmd: quietStatus.todayYmd,
+        });
+      }
+      scheduleState = store.getQuietScheduleState?.() || {};
+      quietQueue = store.getQuietQueue?.() || [];
+      quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
+    }
+
+    if (quietStatus.shouldDeliverPostSnoozeDigest) {
+      if (quietQueue.length > 0) {
+        const digestText = formatQuietDigestMessage(quietQueue, {
+          header: `⏰ Erteleme süresi bitti. Bekleyen mesajlar (${quietQueue.length}):`,
+        });
+        await sendOwnerNotice(digestText);
+        appendSystemNoticeToHistory(digestText);
+        store.clearQuietQueue?.();
+      }
+      store.setQuietScheduleState?.({
+        snoozedUntilMs: null,
+        pendingSnoozeDigest: false,
+        wasQuietPendingResume: false,
+      });
+      scheduleState = store.getQuietScheduleState?.() || {};
+      quietQueue = store.getQuietQueue?.() || [];
+      quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
+    }
+
+    const delayedEntries = Object.values(store.getPendingDelayedCalls?.() || {});
+    for (const entry of delayedEntries) {
+      if (!entry?.chatId || !Number.isFinite(entry.dueAtMs) || entry.dueAtMs > now) continue;
+
+      const activeCall = callRunning || Boolean(callController.isCallActive?.());
+      if (activeCall && !quietStatus.isQuietNow) {
+        const bumpedDueMs = now + 60_000;
+        store.upsertPendingDelayedCall?.({ ...entry, dueAtMs: bumpedDueMs });
+        armDelayTimer(entry.chatId, bumpedDueMs);
+        continue;
+      }
+
+      cancelPendingDelayedCall(entry.chatId);
+      const messages = Array.isArray(entry.messages) ? entry.messages.filter(Boolean) : [];
+      const summaryText = buildMergedSummary(messages);
+      const latestMessage = messages[messages.length - 1] || '';
+
+      if (quietStatus.isQuietNow) {
+        store.enqueueQuietMessage?.({
+          chatId: entry.chatId,
+          customerName: entry.customerName || entry.chatId,
+          phone: String(entry.chatId).replace(/@.*$/, ''),
+          priority: entry.priority || 'normal',
+          summary: summaryText,
+          latestMessage,
+          atMs: now,
+        });
+        if (quietStatus.scheduledQuiet) {
+          store.setQuietScheduleState?.({ wasQuietPendingResume: true });
+        }
+        continue;
+      }
+
+      const chatState = store.getChatState?.(entry.chatId);
+      const suppressionReason = evaluateCallSuppressionReason({
+        store,
+        chatState,
+        config,
+        callInProgress: false,
+        nowMs: now,
+      });
+
+      if (suppressionReason || settings.callPolicy === 'on_demand') {
+        const reason = suppressionReason || 'on_demand_policy';
+        const silentReasons = new Set([
+          'silenced',
+          'owner_active_window',
+          'third_party_outreach',
+          'recent_text_reply_cooldown',
+          'answered_cooldown',
+          'rejected_cooldown',
+        ]);
+        if (!silentReasons.has(reason) && summaryText) {
+          const quietNotice = `🔕 ${entry.customerName || entry.chatId}: ${summaryText}`;
+          await sendOwnerNotice(quietNotice);
+          appendSystemNoticeToHistory(quietNotice);
+        }
+        continue;
+      }
+
+      store.setPendingCallChatId?.(entry.chatId);
+      const noticeText = `📩 ${entry.customerName || entry.chatId}: ${summaryText}\n📞 ${config.assistantName || 'Asistan'} sizi arıyor...`;
+      await sendOwnerNotice(noticeText);
+      appendSystemNoticeToHistory(noticeText);
+      await initiateOwnerCall({
+        targetChatId: entry.chatId,
+        customerName: entry.customerName || entry.chatId,
+        triggerBody: summaryText,
+      });
+    }
+  }
+
+  function processScheduledEvents(overrideNowMs) {
+    const run = scheduleRunChain.then(() => runScheduledTick(overrideNowMs));
+    scheduleRunChain = run.catch(() => {});
+    return run;
+  }
+
+  for (const entry of Object.values(store.getPendingDelayedCalls?.() || {})) {
+    if (entry?.chatId && Number.isFinite(entry.dueAtMs)) {
+      armDelayTimer(entry.chatId, entry.dueAtMs);
+    }
+  }
+
   async function handleIncomingMessage(msg) {
+    const now = nowFn();
     const callInProgress = callRunning || Boolean(callController.isCallActive?.());
     const decision = evaluateIncomingMessage(msg, {
       config,
       store,
       callInProgress,
-      nowMs: nowFn(),
+      nowMs: now,
     });
 
     if (decision.action === 'ignore' || decision.action === 'update_owner_reply') {
+      if (decision.action === 'update_owner_reply') {
+        const replyChatId = decision.targetChatId || msg.chatId || msg.to || msg.from;
+        if (replyChatId) {
+          cancelPendingDelayedCall(replyChatId);
+          clearQuietQueueForChat(replyChatId);
+        }
+      }
       return decision;
     }
 
@@ -882,22 +1215,157 @@ export function createOrchestrator({
     const targetChatId = decision.targetChatId || msg.chatId || msg.from;
     const customerName = formatSenderLabel(msg, targetChatId);
     const triggerBody = formatMessagePreview(msg) || decision.summaryText;
+    const settings = resolveCallSettings(config, store);
+    const scheduleState = store.getQuietScheduleState?.() || {};
+    const quietQueue = store.getQuietQueue?.() || [];
+    const quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
+
+    const isVoiceNote = msg?.type === 'ptt' || msg?.type === 'audio';
+    const shouldTriage =
+      settings.callPolicy === 'smart' ||
+      (quietStatus.isQuietNow && settings.quietHoursAllowUrgent);
+
+    let triage = {
+      priority: 'normal',
+      reason: 'default_policy',
+      summary: decision.summaryText,
+      source: 'none',
+    };
+
+    const existingDelayed = getPendingDelayedByIdentity(targetChatId);
+
+    if (shouldTriage) {
+      if (isVoiceNote) {
+        triage = {
+          priority: 'urgent',
+          reason: 'voice_note',
+          summary: decision.summaryText,
+          source: 'rule',
+        };
+      } else {
+        triage = await triageMessage({
+          event: msg,
+          summaryText: decision.summaryText,
+          recentMessages: existingDelayed?.messages || [],
+          config,
+        });
+      }
+
+      if (triage.priority === 'ignore') {
+        if (store.getPendingCallChatId?.() === targetChatId) {
+          store.setPendingCallChatId(null);
+        }
+        return {
+          ...decision,
+          action: 'notify_only',
+          reason: 'trivial_ignored',
+          triage,
+        };
+      }
+    }
+
+    const bypassQuietForCritical =
+      quietStatus.isQuietNow &&
+      settings.quietHoursAllowUrgent === true &&
+      triage.priority === 'critical' &&
+      decision.action === 'notify_and_call';
+
+    if (quietStatus.isQuietNow && !bypassQuietForCritical) {
+      if (store.getPendingCallChatId?.() === targetChatId) {
+        store.setPendingCallChatId(null);
+      }
+      const priorMsgs = existingDelayed?.messages || [];
+      const baseSummary = triage.summary || decision.summaryText;
+      const queuedSummary = priorMsgs.length > 0 ? buildMergedSummary(priorMsgs, baseSummary) : baseSummary;
+      cancelPendingDelayedCall(targetChatId);
+      store.enqueueQuietMessage?.({
+        chatId: targetChatId,
+        customerName,
+        phone: String(msg?.phone || targetChatId || '').replace(/@.*$/, ''),
+        priority: triage.priority || 'normal',
+        summary: queuedSummary,
+        latestMessage: decision.summaryText,
+        atMs: now,
+      });
+      if (quietStatus.scheduledQuiet) {
+        store.setQuietScheduleState?.({
+          wasQuietPendingResume: true,
+          ...(scheduleState.resumeConfirmedYmd === quietStatus.todayYmd
+            ? {}
+            : { resumeConfirmedYmd: null }),
+        });
+      }
+      return {
+        ...decision,
+        action: 'notify_only',
+        reason: 'quiet_hours_queued',
+        triage,
+      };
+    }
 
     if (decision.action === 'notify_only') {
       const noticeText =
         decision.reason === 'voice_disabled'
           ? `🔕 ${customerName} (Sesli arama kapalı - AI_VOICE_PROVIDER=none): ${decision.summaryText}`
-          : `🔕 ${customerName}: ${decision.summaryText}`;
+          : decision.reason === 'on_demand_policy'
+            ? `🔕 ${customerName} (İstek üzeri arama modu): ${decision.summaryText}`
+            : `🔕 ${customerName}: ${decision.summaryText}`;
       await sendOwnerNotice(noticeText);
       appendSystemNoticeToHistory(noticeText);
       return decision;
     }
 
     if (decision.action === 'notify_and_call') {
-      const noticeText = `📩 ${customerName}: ${decision.summaryText}\n📞 ${config.assistantName || 'Asistan'} sizi arıyor...`;
+      if (
+        settings.callPolicy === 'smart' &&
+        triage.priority === 'normal' &&
+        settings.callDelayMinutes > 0
+      ) {
+        if (store.getPendingCallChatId?.() === targetChatId) {
+          store.setPendingCallChatId(null);
+        }
+        const existingDelayed = store.getPendingDelayedCall?.(targetChatId);
+        const dueAtMs = now + Math.round(settings.callDelayMinutes * 60_000);
+        const nextMessages = [...(existingDelayed?.messages || []), triggerBody];
+        store.upsertPendingDelayedCall?.({
+          chatId: targetChatId,
+          customerName,
+          dueAtMs,
+          firstMessageAt: existingDelayed?.firstMessageAt ?? now,
+          lastMessageAt: now,
+          messages: nextMessages,
+          priority: 'normal',
+          reason: triage.reason || 'delayed_debounce',
+        });
+        armDelayTimer(targetChatId, dueAtMs);
+
+        if (!existingDelayed) {
+          const delayedNotice = `📩 ${customerName}: ${decision.summaryText}\n⏳ Normal mesaj — müşteri yazmayı bırakınca (${settings.callDelayMinutes} dk sonra) aranacaksınız.`;
+          await sendOwnerNotice(delayedNotice);
+          appendSystemNoticeToHistory(delayedNotice);
+        }
+        return {
+          ...decision,
+          action: 'notify_only',
+          reason: 'smart_delayed',
+          dueAtMs,
+          triage,
+        };
+      }
+
+      const priorMsgs = existingDelayed?.messages || [];
+      const mergedSummary =
+        priorMsgs.length > 0 ? buildMergedSummary(priorMsgs, decision.summaryText) : decision.summaryText;
+      const mergedTrigger =
+        priorMsgs.length > 0 ? buildMergedSummary(priorMsgs, triggerBody) : triggerBody;
+      cancelPendingDelayedCall(targetChatId);
+      clearQuietQueueForChat(targetChatId);
+      store.setPendingCallChatId?.(targetChatId);
+      const prefix = bypassQuietForCritical ? '🚨 [Mesai Dışı Çok Acil] ' : '';
+      const noticeText = `${prefix}📩 ${customerName}: ${mergedSummary}\n📞 ${config.assistantName || 'Asistan'} sizi arıyor...`;
       await sendOwnerNotice(noticeText);
       appendSystemNoticeToHistory(noticeText);
-      await initiateOwnerCall({ targetChatId, customerName, triggerBody });
+      await initiateOwnerCall({ targetChatId, customerName, triggerBody: mergedTrigger });
       return decision;
     }
 
@@ -905,6 +1373,9 @@ export function createOrchestrator({
   }
 
   function shutdown() {
+    for (const chatId of Array.from(activeDelayTimers.keys())) {
+      clearDelayTimerForChat(chatId);
+    }
     store.flush?.();
   }
 
@@ -914,6 +1385,7 @@ export function createOrchestrator({
     handleStartupReady,
     maybeNotifyPendingUpdateAfterConversation,
     checkForUpdateInBackground,
+    processScheduledEvents,
     shutdown,
   };
 }
@@ -1013,11 +1485,22 @@ export async function main() {
   }, UPDATE_CHECK_CACHE_TTL_MS);
   updateTimer.unref?.();
 
+  const scheduleTimer = setInterval(() => {
+    Promise.resolve(orchestrator?.processScheduledEvents?.()).catch((err) => {
+      console.error(
+        `[${config.assistantName}] Zamanlayıcı/mesai kontrolü hatası:`,
+        err?.message || err
+      );
+    });
+  }, 60_000);
+  scheduleTimer.unref?.();
+
   const handleSignal = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`\n[${config.assistantName}] ${signal} alındı, güvenli kapatılıyor...`);
     clearInterval(updateTimer);
+    clearInterval(scheduleTimer);
     try {
       orchestrator?.shutdown?.();
       await whatsapp.destroy?.();

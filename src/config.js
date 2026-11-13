@@ -2,6 +2,16 @@ import fs from 'node:fs';
 import { normalizePhone, toWhatsAppId } from './utils/phone.js';
 import { resolveTextProviderConfig, resolveVoiceProviderConfig } from './ai/providers.js';
 import { DEFAULT_GITHUB_REPO_URL, DEFAULT_UPDATE_CHECK_URL } from './update/checker.js';
+import {
+  DEFAULT_CALL_DELAY_MINUTES,
+  DEFAULT_CALL_POLICY,
+  DEFAULT_QUIET_END,
+  DEFAULT_QUIET_START,
+  DEFAULT_RESUME_MODE,
+  VALID_CALL_POLICIES,
+  VALID_RESUME_MODES,
+  parseHhMm,
+} from './trigger/settings.js';
 
 let PACKAGE_META = {
   version: '0.2.0',
@@ -69,6 +79,32 @@ export function loadConfig(env = process.env, deps = {}) {
     env.GEMINI_TEXT_MODEL?.trim() ||
     (textCfg.provider === 'gemini' ? textCfg.model : 'gemini-3.8-flash');
 
+  const rawCallPolicy = String(env.CALL_POLICY || DEFAULT_CALL_POLICY).trim().toLowerCase();
+  const callPolicy = VALID_CALL_POLICIES.includes(rawCallPolicy) ? rawCallPolicy : DEFAULT_CALL_POLICY;
+  const rawDelayMinutes = env.CALL_DELAY_MINUTES;
+  const parsedDelayMinutes = rawDelayMinutes !== undefined && rawDelayMinutes !== '' ? Number(rawDelayMinutes) : NaN;
+  const callDelayMinutes =
+    Number.isFinite(parsedDelayMinutes) && parsedDelayMinutes >= 0
+      ? Math.min(parsedDelayMinutes, 180)
+      : DEFAULT_CALL_DELAY_MINUTES;
+
+  const rawQuietStart = parseHhMm(String(env.QUIET_HOURS_START || ''));
+  const rawQuietEnd = parseHhMm(String(env.QUIET_HOURS_END || ''));
+  const rawQuietFlag = String(env.QUIET_HOURS_ENABLED ?? '').trim().toLowerCase();
+  const quietHoursEnabled =
+    rawQuietFlag === 'false' || rawQuietFlag === '0' || rawQuietFlag === 'no'
+      ? false
+      : rawQuietFlag === 'true' || rawQuietFlag === '1' || rawQuietFlag === 'yes'
+        ? true
+        : Boolean(rawQuietStart && rawQuietEnd);
+  const rawResumeMode = String(env.QUIET_HOURS_RESUME_MODE || DEFAULT_RESUME_MODE).trim().toLowerCase();
+  const quietHoursResumeMode = VALID_RESUME_MODES.includes(rawResumeMode)
+    ? rawResumeMode
+    : DEFAULT_RESUME_MODE;
+  const rawAllowUrgent = String(env.QUIET_HOURS_ALLOW_URGENT ?? '').trim().toLowerCase();
+  const quietHoursAllowUrgent =
+    rawAllowUrgent === 'true' || rawAllowUrgent === '1' || rawAllowUrgent === 'yes';
+
   return {
     ownerPhone,
     ownerChatId,
@@ -94,6 +130,13 @@ export function loadConfig(env = process.env, deps = {}) {
     callRingTimeoutSec: Number(env.CALL_RING_TIMEOUT_SEC ?? 35),
     callMaxDurationSec: Number(env.CALL_MAX_DURATION_SEC ?? 300),
     thirdPartyOutreachHours: Number(env.THIRD_PARTY_OUTREACH_HOURS ?? 24),
+    callPolicy,
+    callDelayMinutes,
+    quietHoursEnabled,
+    quietHoursStart: rawQuietStart ? rawQuietStart.formatted : DEFAULT_QUIET_START,
+    quietHoursEnd: rawQuietEnd ? rawQuietEnd.formatted : DEFAULT_QUIET_END,
+    quietHoursResumeMode,
+    quietHoursAllowUrgent,
     chromeHeadless,
     chromeExecutablePath: env.CHROME_EXECUTABLE_PATH?.trim() || '',
     stateFilePath: env.STATE_FILE_PATH || './data/state.json',

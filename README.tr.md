@@ -6,6 +6,7 @@
 [![Voice AI](https://img.shields.io/badge/Voice%20AI-Gemini%20Live%20%7C%20OpenAI%20Realtime-4285F4)](#desteklenen-yapay-zekâ-sağlayıcıları)
 [![Text AI](https://img.shields.io/badge/Text%20AI-Gemini%20%7C%20OpenAI%20%7C%20DeepSeek%20%7C%20Ollama%20%7C%20Claude-111827)](#desteklenen-yapay-zekâ-sağlayıcıları)
 [![WhatsApp WebRTC](https://img.shields.io/badge/WhatsApp%20Web-WebRTC%20%2B%20AudioWorklet-25D366?logo=whatsapp&logoColor=white)](#mimari)
+[![Sürüm](https://img.shields.io/badge/Sürüm-v0.2.1-0ea5e9)](#v021-yenilikleri)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Dil Notu:** Veko şu anda **yalnızca Türkçe** için optimize edilmiştir (sistem istemleri, WhatsApp komutları ve `Europe/Istanbul` saat dilimi analizleri). Diğer diller için optimize edildikçe güncellenip paylaşılacaktır.
@@ -54,6 +55,11 @@ flowchart LR
 * **Sağlam `@lid` Kimlik Doğrulama:** WhatsApp `@lid` kimliklerini ters `OWNER_PHONE` eşleştirmesiyle doğrular; çözümlenemeyen yabancı `@lid` aramaları açılmaz.
 * **Rahatsız Etmeyen Güncelleme Bildirimleri:** İlk kurulumda tek seferlik bilgilendirme mesajı atar, yeniden başlatmalarda **15 dakikalık spam koruması** uygular ve 7/24 çalışmada gece yarısı asla mesaj atmaz — yeni sürüm bildirimini yalnızca cevaplanan bir sesli görüşme veya yazılı sohbet tamamlandığında iletir (*"Güncelleme bildirimi kapat"* diyerek veya doğal dille kapatılabilir).
 * **Grup ve Kanal Koruması:** Grup (`@g.us`), durum (`status@broadcast`), yayın listesi ve bülten (`@newsletter`) sohbetleri yoksayılır.
+
+### 🎯 Akıllı Triyaj, 10 Dakikalık Bekleme & Mesai Dışı (Sessiz Saatler)
+* **İki Kademeli Gürültü Filtreleme (`CALL_POLICY=smart`):** Sıfır maliyetli kurallar `"tamam"`, `"teşekkürler"`, tek emoji, çıkartma ve otomatik OTP/banka/kargo bildirimlerini eler; kalan müşteri mesajları aktif metin AI tarafından önceliklendirilir (`ignore`, `normal`, `urgent`, `critical`).
+* **Kayan 10 Dakikalık Bekleme (`CALL_DELAY_MINUTES=10`):** Normal müşteri mesajlarını müşteri yazmayı bitirene kadar bekletir (her yeni mesajda süreyi yeniler, siz manuel yanıt verirseniz iptal eder; `urgent`/`critical` mesajlarda veya sesli notlarda beklemeden anında arar).
+* **Mesai Dışı & Sabah Özeti (`QUIET_HOURS_*`):** Türkiye saatiyle (`Europe/Istanbul`) mesai dışı saatlerde kritik olmayan mesajları sessizce kuyruğa alır (isteğe bağlı olarak `QUIET_HOURS_ALLOW_URGENT=true` ile yalnızca `critical` acil durumlarda uyandırır), sabah saatinde toplu özet atar (`auto`) veya *"mesai başlasın mı?"* diye sorar (`ask`) — WhatsApp'tan sesli veya yazılı (`get_call_settings` / `update_call_settings`) yönetilebilir.
 
 ---
 
@@ -124,6 +130,13 @@ GEMINI_API_KEY=AIza...
 | `AI_TEXT_BASE_URL` | Sağlayıcıya bağlı | Özel API / Ollama / OpenAI uyumlu uç nokta |
 | `CHROME_HEADLESS` | `new` | Canlı sesli arama için `false` önerilir |
 | `CHROME_EXECUTABLE_PATH` | *(otomatik)* | Özel Chrome/Edge yürütülebilir dosya yolu |
+| `CALL_POLICY` | `smart` | Arama politikası: `smart` (triyaj + bekleme), `always` (anında ara) veya `on_demand` (sadece bildirim) |
+| `CALL_DELAY_MINUTES` | `10` | `smart` modda normal mesajlar için kayan bekleme süresi (dk) |
+| `QUIET_HOURS_ENABLED` | `false` | `Europe/Istanbul` sessiz saatleri açar (başlangıç/bitiş girilirse `false` olmadıkça otomatik açılır) |
+| `QUIET_HOURS_START` | `22:00` | Sessiz saat başlangıcı (`HH:MM`, İstanbul saati) |
+| `QUIET_HOURS_END` | `09:00` | Sessiz saat bitişi (`HH:MM`, İstanbul saati) |
+| `QUIET_HOURS_RESUME_MODE` | `auto` | Sabah dönüş modu: `auto` (toplu özet gönder) veya `ask` (önce onay sor) |
+| `QUIET_HOURS_ALLOW_URGENT` | `false` | `true` iken sessiz saatlerde yalnızca `critical` acil durumlarda arama yapar |
 | `CALL_RING_TIMEOUT_SEC` | `35` | Çalma zaman aşımı (saniye) |
 | `CALL_MAX_DURATION_SEC` | `300` | Maksimum arama süresi (saniye) |
 | `COOLDOWN_MINUTES` | `120` | Cevaplanan arama veya onaylı yazılı yanıt sonrası bekleme süresi (dk) |
@@ -149,13 +162,13 @@ npm start
 3. Yeni sürümlerden e-posta/bildirim ile haberdar olmak için sayfanın sağ üstünden **Watch → Custom → Releases** seçeneğini açabilirsiniz.
 
 ### Hızlı WhatsApp Komutları (İşletme Sahibinden)
-* `durum` — Aktif/susturulmuş durum, aktif/bekleyen arama, sürüm ve güncelleme bildirimi durumunu gösterir.
+* `durum` — Aktif/susturulmuş durum, aktif/bekleyen arama, arama modu/gecikme, mesai dışı kuyruğu, sürüm ve güncelleme bildirimi durumunu gösterir.
 * `ara` — Cevapsız/bekleyen son müşteri sohbeti için sesli arama başlatır.
 * `ara <isim veya numara>` — Eşleşen kişi için bağlam yükleyip sesli arama başlatır.
 * `sustur <dakika>` — Sesli aramaları belirtilen dakika boyunca susturur (varsayılan `60` dk).
 * `devam` — Susturmayı hemen kaldırır.
 
-Komut dışındaki tüm mesajlarınız doğrudan Veko metin asistanına yönlendirilir *(ör. müşteri sayımı, sohbet özeti, onay kilitli mesaj gönderimi veya "güncelleme bildirimi kapat/aç" gibi doğal dil istekleri)*.
+Komut dışındaki tüm mesajlarınız doğrudan Veko metin asistanına yönlendirilir *(ör. müşteri sayımı, sohbet özeti, 2 adımlı onay kilitli mesaj gönderimi, `"mesai 9'da başlasın"` / `"bekleme 5 dk olsun"` / `"10:30'a ertele"` gibi çalışma ayarları ve `"güncelleme bildirimi kapat/aç"` gibi doğal dil istekleri)*.
 
 ---
 
@@ -167,7 +180,7 @@ Uzak masaüstü (RDP) bağlantısı kapatıldığında Chrome WebRTC ses köprü
 powershell -ExecutionPolicy Bypass -File scripts/vds-setup.ps1 -InstallPm2 -RegisterScheduledTask
 ```
 
-RDP penceresini oturumu kilitlemeden kapatmak için [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) dosyasını **Yönetici olarak** çalıştırın (`tscon %SESSIONNAME% /dest:console`).
+RDP penceresini oturumu kilitlemeden kapatmak için [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) dosyasını **Yönetici olarak** çalıştırın (`tscon` aktif Windows `SessionId` ile konsola devreder).
 
 ---
 
@@ -180,6 +193,16 @@ npm test
 # WebRTC / sesli arama DOM & Worklet test spike'ı
 npm run spike
 ```
+
+---
+
+## 🆕 v0.2.1 Yenilikleri
+
+* **Akıllı Arama Triyajı (`CALL_POLICY=smart`):** Teşekkür, emoji, çıkartma ve OTP/kargo bildirimlerini AI maliyeti olmadan eler; müşteri mesajlarını önceliklendirir (`ignore`, `normal`, `urgent`, `critical`).
+* **Kayan 10 Dakikalık Bekleme (`CALL_DELAY_MINUTES=10`):** Arka arkaya yazılan normal müşteri mesajlarını tek aramada birleştirir; acil mesajlarda ve sesli notlarda beklemeyi kırıp hemen arar.
+* **Mesai Dışı & Sabah Kontrolü (`QUIET_HOURS_*`):** Gece gelen mesajları `Europe/Istanbul` saatine göre sessizce biriktirip sabah toplu özet (`auto`) ya da *"mesai başlasın mı?"* onay/erteleme akışı (`ask`) sunar.
+* **WhatsApp'tan Canlı Ayar Yönetimi:** Sesli veya yazılı sohbette doğal dille arama politikasını, bekleme süresini, sessiz saatleri ve ertelemeyi değiştirebilme (`get_call_settings` / `update_call_settings`).
+* **VDS RDP Bağlantı Kesme Düzeltmesi:** [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) eski `%SESSIONNAME%` yerine canlı Windows `SessionId` çözecek şekilde güncellendi.
 
 ---
 
