@@ -6,14 +6,14 @@
 [![Voice AI](https://img.shields.io/badge/Voice%20AI-Gemini%20Live%20%7C%20OpenAI%20Realtime-4285F4)](#supported-ai-providers)
 [![Text AI](https://img.shields.io/badge/Text%20AI-Gemini%20%7C%20OpenAI%20%7C%20DeepSeek%20%7C%20Ollama%20%7C%20Claude-111827)](#supported-ai-providers)
 [![WhatsApp WebRTC](https://img.shields.io/badge/WhatsApp%20Web-WebRTC%20%2B%20AudioWorklet-25D366?logo=whatsapp&logoColor=white)](#architecture)
-[![Release](https://img.shields.io/badge/Release-v0.2.1-0ea5e9)](#whats-new-in-v021)
+[![Release](https://img.shields.io/badge/Release-v0.2.1-0ea5e9)](https://github.com/holy2k/veko/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Language Optimization Notice:** Veko is currently optimized for **Turkish** (system prompts, WhatsApp commands, and `Europe/Istanbul` calendar analytics). Support and optimizations for English and additional languages will be added and shared progressively.
 
 **Veko** is a 24/7 open-source **WhatsApp Business voice & text executive assistant** built on `whatsapp-web.js`, **Chromium WebRTC / AudioWorklet** audio bridging, and **multi-provider AI**.
 
-When a customer messages your business WhatsApp line, Veko calls the business owner (`OWNER_PHONE`) over WhatsApp Voice (or automatically answers when the owner calls the business line), summarizes the chat history without triggering read receipts ("blue ticks"), and only sends outbound messages after explicit verbal or 2-step written confirmation.
+When a customer messages your business WhatsApp line, Veko triages the inquiry, calls the business owner (`OWNER_PHONE`) over WhatsApp Voice according to your active call policy and quiet hours (or automatically answers when the owner calls the business line), summarizes the chat history without triggering read receipts ("blue ticks"), and only sends outbound messages after explicit verbal or 2-step written confirmation.
 
 ---
 
@@ -38,14 +38,20 @@ flowchart LR
 ## ✨ Key Features
 
 ### 📞 Bidirectional WhatsApp Voice Calling
-* **Automated Outbound Calls:** Calls the owner on WhatsApp when a qualifying customer message arrives (respecting cooldown, retry, and active-owner suppression windows).
+* **Automated Outbound Calls:** Calls the owner on WhatsApp when a qualifying customer message arrives (governed by smart triage, debounce, quiet hours, cooldown, retry, and active-owner suppression rules).
 * **Owner Incoming Call Auto-Answer:** When the owner calls the business line from `OWNER_PHONE`, Veko automatically picks up and reports pending or unread customer chats.
 * **No Virtual Audio Cable Required:** Injects a browser-side `WebRTC` + `AudioWorklet` bridge directly into Chromium for bidirectional 16 kHz / 24 kHz PCM audio streaming.
 * **Text-Only Mode (`AI_VOICE_PROVIDER=none`):** Disable voice calls and run Veko purely as a silent notification + WhatsApp text assistant.
 
+### 🎯 Smart Call Triage, Debounce & Quiet Hours
+* **Two-Tier Noise Filtering (`CALL_POLICY=smart`):** Zero-cost rules filter out trivial closings (`"tamam"`, `"teşekkürler"`, pure emojis, stickers) and automated OTP/bank/shipping alerts, while the configured text AI classifies customer intent (`ignore`, `normal`, `urgent`, `critical`).
+* **Sliding Debounce Window (`CALL_DELAY_MINUTES=10`):** Normal inquiries buffer until the customer finishes texting—resetting per message, cancelling automatically if you reply manually or via Veko, and calling immediately on `urgent`/`critical` messages or voice notes.
+* **Quiet Hours & Morning Check-In (`QUIET_HOURS_*`):** Silently queues non-critical messages during `Europe/Istanbul` quiet hours (optionally ringing only for `critical` emergencies when `QUIET_HOURS_ALLOW_URGENT=true`), then delivers a single morning digest (`auto`) or asks to start the shift (`ask`) with snooze support.
+
 ### 💬 Free-Form WhatsApp Text Assistant & Customer Analytics
 * **Calendar Customer Analytics (`get_customer_stats`):** Ask questions via WhatsApp such as *"How many customers messaged this month?"*, *"Who wrote today?"*, or *"Are there unread chats?"* — computed in `Europe/Istanbul` time while excluding outbound-only chats and active third-party suppliers.
 * **Context & Contact Lookup:** Search contacts and read chat history (`search_contacts`, `list_recent_chats`, `get_chat_history`) without triggering read receipts.
+* **Runtime Schedule & Call Controls:** Inspect and update call policy, debounce delay, quiet hours, snooze, and morning resume in natural language (`get_call_settings`, `update_call_settings`) from either WhatsApp text chat or live voice calls.
 * **Instant Control Commands:** Quick commands (`durum`, `ara`, `ara <name/phone>`, `sustur <minutes>`, `devam`) run immediately without consuming LLM tokens.
 
 ### 🔒 Security, Privacy & Smart Notifications
@@ -55,11 +61,6 @@ flowchart LR
 * **Verified `@lid` Identity Resolution:** Resolves WhatsApp `@lid` identifiers with reverse `OWNER_PHONE` verification so unknown or unresolved `@lid` calls are never auto-answered.
 * **Non-Intrusive Update Notifications:** Sends a one-time setup message upon first installation, applies a 15-minute cooldown to restart notices, and never wakes the owner at night — delivering new release notices only right after an answered call or text chat turn (toggleable via natural language or *"Güncelleme bildirimi kapat"*).
 * **Channel Filtering:** Ignores groups (`@g.us`), status updates (`status@broadcast`), broadcast lists, and newsletters (`@newsletter`).
-
-### 🎯 Smart Triage, 10-Min Debounce & Quiet Hours
-* **Two-Tier Noise Filtering (`CALL_POLICY=smart`):** Zero-cost rules ignore trivial closings (`"tamam"`, `"teşekkürler"`, pure emojis, stickers) and automated OTP/bank notifications, while the configured text AI triages customer intent (`ignore`, `normal`, `urgent`, `critical`).
-* **Sliding 10-Minute Debounce (`CALL_DELAY_MINUTES=10`):** Normal inquiries buffer until the customer finishes texting (resetting per message, cancelling if you reply manually, and calling immediately on `urgent`/`critical` messages or voice notes).
-* **Quiet Hours & Morning Check-In (`QUIET_HOURS_*`):** Silently queues non-critical messages during `Europe/Istanbul` quiet hours (optionally waking only for `critical` emergencies when `QUIET_HOURS_ALLOW_URGENT=true`), then delivers a single morning digest (`auto`) or asks `"mesai başlasın mı?"` (`ask`) — all controllable at runtime via WhatsApp text/voice (`get_call_settings` / `update_call_settings`).
 
 ---
 
@@ -168,7 +169,7 @@ npm start
 * `sustur <minutes>` — Silences voice calls for N minutes (defaults to `60`).
 * `devam` — Resumes voice calls immediately.
 
-Any other message from `OWNER_PHONE` is routed to the Veko text assistant (including customer counts, chat summaries, 2-step draft-locked replies, runtime call/quiet-hours adjustments, and natural-language requests to enable, disable, or check update notifications).
+Any other message from `OWNER_PHONE` is routed to the Veko text assistant — including customer analytics, chat summaries, 2-step draft-locked replies, runtime schedule/call-policy adjustments (such as changing quiet hours, adjusting debounce delay, snoozing, or starting the shift), and natural-language update notification controls.
 
 ---
 
@@ -193,16 +194,6 @@ npm test
 # WebRTC / voice call DOM & AudioWorklet spike check
 npm run spike
 ```
-
----
-
-## 🆕 What's New in v0.2.1
-
-* **Smart Call Triage (`CALL_POLICY=smart`):** Filters trivial closings, stickers, emojis, and automated OTP/bank alerts at zero AI cost, while prioritizing real inquiries (`ignore`, `normal`, `urgent`, `critical`).
-* **Sliding 10-Min Debounce (`CALL_DELAY_MINUTES=10`):** Batches multi-message customer inquiries into one call and breaks immediately for urgent messages or voice notes.
-* **Quiet Hours & Morning Resume (`QUIET_HOURS_*`):** Buffers overnight/off-hours messages silently in `Europe/Istanbul` time with `auto` digest delivery or `ask` morning confirmation & snooze controls.
-* **WhatsApp Runtime Settings Tools:** Inspect and adjust call policy, delay minutes, quiet hours, snooze, and morning resume via natural-language WhatsApp chat or voice (`get_call_settings` / `update_call_settings`).
-* **VDS Disconnect Script Fix:** Updated [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) to resolve the live Windows `SessionId` cleanly instead of relying on a stale `SESSIONNAME`.
 
 ---
 

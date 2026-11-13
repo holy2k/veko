@@ -6,14 +6,14 @@
 [![Voice AI](https://img.shields.io/badge/Voice%20AI-Gemini%20Live%20%7C%20OpenAI%20Realtime-4285F4)](#desteklenen-yapay-zekâ-sağlayıcıları)
 [![Text AI](https://img.shields.io/badge/Text%20AI-Gemini%20%7C%20OpenAI%20%7C%20DeepSeek%20%7C%20Ollama%20%7C%20Claude-111827)](#desteklenen-yapay-zekâ-sağlayıcıları)
 [![WhatsApp WebRTC](https://img.shields.io/badge/WhatsApp%20Web-WebRTC%20%2B%20AudioWorklet-25D366?logo=whatsapp&logoColor=white)](#mimari)
-[![Sürüm](https://img.shields.io/badge/Sürüm-v0.2.1-0ea5e9)](#v021-yenilikleri)
+[![Sürüm](https://img.shields.io/badge/Sürüm-v0.2.1-0ea5e9)](https://github.com/holy2k/veko/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Dil Notu:** Veko şu anda **yalnızca Türkçe** için optimize edilmiştir (sistem istemleri, WhatsApp komutları ve `Europe/Istanbul` saat dilimi analizleri). Diğer diller için optimize edildikçe güncellenip paylaşılacaktır.
 
 **Veko**, `whatsapp-web.js`, **Chromium WebRTC / AudioWorklet** ses köprüsü ve **çoklu yapay zekâ sağlayıcı mimarisi** üzerine kurulu, 7/24 çalışan açık kaynaklı WhatsApp Business sesli ve yazılı yönetici asistanıdır.
 
-İşletme hattına bir müşteri yazdığında işletme sahibini (`OWNER_PHONE`) WhatsApp üzerinden sesli arar (veya işletme sahibi kendi hattını aradığında çağrıyı otomatik yanıtlar), okundu bilgisi (mavi tik) göndermeden müşteri geçmişini özetler. Aynı zamanda WhatsApp üzerinden serbest yazılı sohbetle müşteri istatistikleri sunar ve **yalnızca açık sözlü veya 2 adımlı yazılı onay alındığında** mesaj gönderir.
+İşletme hattına bir müşteri yazdığında mesajı akıllı triyajdan geçirip belirlenen arama politikası ve mesai saatlerine göre işletme sahibini (`OWNER_PHONE`) WhatsApp üzerinden sesli arar (veya işletme sahibi kendi hattını aradığında çağrıyı otomatik yanıtlar), okundu bilgisi (mavi tik) göndermeden müşteri geçmişini özetler. Aynı zamanda WhatsApp üzerinden serbest yazılı sohbetle müşteri istatistikleri ile mesai/arama ayarlarını yönetir ve **yalnızca açık sözlü veya 2 adımlı yazılı onay alındığında** mesaj gönderir.
 
 ---
 
@@ -38,14 +38,20 @@ flowchart LR
 ## ✨ Öne Çıkan Özellikler
 
 ### 📞 Çift Yönlü WhatsApp Sesli Arama
-* **Otomatik Giden Arama:** Uygun bir müşteri mesajı geldiğinde işletme sahibini WhatsApp üzerinden sesli arar (bekleme süresi, yeniden deneme ve işletme sahibi aktif pencere kurallarına uyar).
+* **Otomatik Giden Arama:** Uygun bir müşteri mesajı geldiğinde akıllı triyaj, bekleme süresi, sessiz saatler, yeniden deneme ve işletme sahibi aktif pencere kurallarına uyarak işletme sahibini WhatsApp üzerinden sesli arar.
 * **Gelen Aramayı Otomatik Yanıtlama:** İşletme sahibi (`OWNER_PHONE`) kendi numarasından işletme hattını birebir sesli aradığında Veko çağrıyı otomatik açar ve bekleyen/okunmamış sohbetleri raporlar.
 * **Sanal Ses Kartı Gerektirmez:** Chromium içine enjekte edilen özel `WebRTC` + `AudioWorklet` ses köprüsüyle doğrudan tarayıcı belleği üzerinden 16 kHz / 24 kHz PCM ses aktarımı yapar.
 * **Sadece Metin Modu (`AI_VOICE_PROVIDER=none`):** Sesli aramayı kapatıp Veko'yu yalnızca sessiz bildirim ve yazılı WhatsApp asistanı olarak çalıştırabilirsiniz.
 
+### 🎯 Akıllı Triyaj, Bekleme Süresi & Mesai Dışı (Sessiz Saatler)
+* **İki Kademeli Gürültü Filtreleme (`CALL_POLICY=smart`):** Sıfır maliyetli kurallar `"tamam"`, `"teşekkürler"`, tek emoji, çıkartma ve otomatik OTP/banka/kargo bildirimlerini eler; kalan müşteri mesajları aktif metin AI tarafından önceliklendirilir (`ignore`, `normal`, `urgent`, `critical`).
+* **Kayan Bekleme Penceresi (`CALL_DELAY_MINUTES=10`):** Normal müşteri mesajlarını müşteri yazmayı bitirene kadar bekletir; her yeni mesajda süreyi yeniler, siz manuel veya Veko üzerinden yanıt verirseniz iptal eder; `urgent`/`critical` mesajlarda veya sesli notlarda beklemeden anında arar.
+* **Mesai Dışı & Sabah Kontrolü (`QUIET_HOURS_*`):** Türkiye saatiyle (`Europe/Istanbul`) mesai dışı saatlerde kritik olmayan mesajları sessizce kuyruğa alır (isteğe bağlı olarak `QUIET_HOURS_ALLOW_URGENT=true` ile yalnızca `critical` acil durumlarda uyandırır); sabah saatinde toplu özet atar (`auto`) veya erteleme seçenekleriyle *"mesai başlasın mı?"* diye sorar (`ask`).
+
 ### 💬 Serbest WhatsApp Yazılı Asistan & Müşteri İstatistikleri
 * **Dönemsel Müşteri Analizi (`get_customer_stats`):** WhatsApp'tan yazarak *"Bu ay kaç müşteri geldi?"*, *"Dün kimler yazdı?"*, *"Okunmamış mesaj var mı?"* gibi soruları Türkiye saatine (`Europe/Istanbul`) göre yanıtlar; giden-tek-yönlü sohbetleri ve aktif tedarikçileri hariç tutar.
 * **Sohbet Geçmişi & Kişi Arama:** `search_contacts`, `list_recent_chats` ve `get_chat_history` araçlarıyla okundu bilgisi göndermeden arama ve özetleme yapar.
+* **Canlı Arama ve Mesai Yönetimi:** Arama politikasını, bekleme süresini, sessiz saatleri, ertelemeyi veya sabah mesai onayını hem yazılı hem sesli sohbette doğal dille (`get_call_settings`, `update_call_settings`) anında güncelleyin.
 * **Hızlı Komutlar:** `durum`, `ara`, `ara <isim veya numara>`, `sustur <dk>` ve `devam` komutları yapay zekâya gitmeden anında çalışır.
 
 ### 🔒 Güvenlik, Gizlilik ve Akıllı Bildirimler
@@ -55,11 +61,6 @@ flowchart LR
 * **Sağlam `@lid` Kimlik Doğrulama:** WhatsApp `@lid` kimliklerini ters `OWNER_PHONE` eşleştirmesiyle doğrular; çözümlenemeyen yabancı `@lid` aramaları açılmaz.
 * **Rahatsız Etmeyen Güncelleme Bildirimleri:** İlk kurulumda tek seferlik bilgilendirme mesajı atar, yeniden başlatmalarda **15 dakikalık spam koruması** uygular ve 7/24 çalışmada gece yarısı asla mesaj atmaz — yeni sürüm bildirimini yalnızca cevaplanan bir sesli görüşme veya yazılı sohbet tamamlandığında iletir (*"Güncelleme bildirimi kapat"* diyerek veya doğal dille kapatılabilir).
 * **Grup ve Kanal Koruması:** Grup (`@g.us`), durum (`status@broadcast`), yayın listesi ve bülten (`@newsletter`) sohbetleri yoksayılır.
-
-### 🎯 Akıllı Triyaj, 10 Dakikalık Bekleme & Mesai Dışı (Sessiz Saatler)
-* **İki Kademeli Gürültü Filtreleme (`CALL_POLICY=smart`):** Sıfır maliyetli kurallar `"tamam"`, `"teşekkürler"`, tek emoji, çıkartma ve otomatik OTP/banka/kargo bildirimlerini eler; kalan müşteri mesajları aktif metin AI tarafından önceliklendirilir (`ignore`, `normal`, `urgent`, `critical`).
-* **Kayan 10 Dakikalık Bekleme (`CALL_DELAY_MINUTES=10`):** Normal müşteri mesajlarını müşteri yazmayı bitirene kadar bekletir (her yeni mesajda süreyi yeniler, siz manuel yanıt verirseniz iptal eder; `urgent`/`critical` mesajlarda veya sesli notlarda beklemeden anında arar).
-* **Mesai Dışı & Sabah Özeti (`QUIET_HOURS_*`):** Türkiye saatiyle (`Europe/Istanbul`) mesai dışı saatlerde kritik olmayan mesajları sessizce kuyruğa alır (isteğe bağlı olarak `QUIET_HOURS_ALLOW_URGENT=true` ile yalnızca `critical` acil durumlarda uyandırır), sabah saatinde toplu özet atar (`auto`) veya *"mesai başlasın mı?"* diye sorar (`ask`) — WhatsApp'tan sesli veya yazılı (`get_call_settings` / `update_call_settings`) yönetilebilir.
 
 ---
 
@@ -193,16 +194,6 @@ npm test
 # WebRTC / sesli arama DOM & Worklet test spike'ı
 npm run spike
 ```
-
----
-
-## 🆕 v0.2.1 Yenilikleri
-
-* **Akıllı Arama Triyajı (`CALL_POLICY=smart`):** Teşekkür, emoji, çıkartma ve OTP/kargo bildirimlerini AI maliyeti olmadan eler; müşteri mesajlarını önceliklendirir (`ignore`, `normal`, `urgent`, `critical`).
-* **Kayan 10 Dakikalık Bekleme (`CALL_DELAY_MINUTES=10`):** Arka arkaya yazılan normal müşteri mesajlarını tek aramada birleştirir; acil mesajlarda ve sesli notlarda beklemeyi kırıp hemen arar.
-* **Mesai Dışı & Sabah Kontrolü (`QUIET_HOURS_*`):** Gece gelen mesajları `Europe/Istanbul` saatine göre sessizce biriktirip sabah toplu özet (`auto`) ya da *"mesai başlasın mı?"* onay/erteleme akışı (`ask`) sunar.
-* **WhatsApp'tan Canlı Ayar Yönetimi:** Sesli veya yazılı sohbette doğal dille arama politikasını, bekleme süresini, sessiz saatleri ve ertelemeyi değiştirebilme (`get_call_settings` / `update_call_settings`).
-* **VDS RDP Bağlantı Kesme Düzeltmesi:** [scripts/disconnect-rdp.bat](scripts/disconnect-rdp.bat) eski `%SESSIONNAME%` yerine canlı Windows `SessionId` çözecek şekilde güncellendi.
 
 ---
 
