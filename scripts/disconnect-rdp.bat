@@ -10,19 +10,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not defined SESSIONNAME (
-    echo [HATA] SESSIONNAME ortam degiskeni bulunamadi.
-    pause
-    exit /b 1
-)
-
-if /i "%SESSIONNAME%"=="Console" (
-    echo [BILGI] Oturum zaten Console uzerinde calisiyor. Islem gerekmiyor.
-    exit /b 0
-)
-
-echo [BILGI] "%SESSIONNAME%" oturumu Console uzerine aktariliyor [Chrome/Edge WebRTC acik kalacak]...
-"%SystemRoot%\System32\tscon.exe" "%SESSIONNAME%" /dest:console /v
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$sid = [Diagnostics.Process]::GetCurrentProcess().SessionId; if ($sid -le 0) { Write-Host '[HATA] Aktif oturum ID gecersiz.'; exit 1 }; $sys = Join-Path $env:SystemRoot 'System32'; $q = & (Join-Path $sys 'query.exe') session 2>$null; if ($q -match '^\s*>console\b') { Write-Host ('[BILGI] Oturum zaten Console uzerinde calisiyor [ID ' + $sid + ']. Islem gerekmiyor.'); exit 0 }; Write-Host ('[BILGI] Oturum [ID ' + $sid + '] Console uzerine aktariliyor [Chrome/Edge WebRTC acik kalacak]...'); & (Join-Path $sys 'tscon.exe') $sid /dest:console /v; exit $LASTEXITCODE"
 if errorlevel 1 (
     echo [HATA] tscon basarisiz oldu. Windows Server uzerinde Yonetici yetkisiyle calistiginizdan emin olun.
     pause
