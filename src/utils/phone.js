@@ -9,12 +9,17 @@
 export function normalizePhone(raw) {
   if (!raw) return '';
   const str = String(raw).trim();
+  if (str.toLowerCase().endsWith('@lid')) return '';
   const userPart = str.split('@')[0].split(':')[0];
   let digits = userPart.replace(/\D/g, '');
 
-  if (digits.startsWith('05') && digits.length === 11) {
+  if (digits.startsWith('00') && digits.length > 10) {
+    digits = digits.slice(2);
+  }
+
+  if (digits.startsWith('0') && digits.length === 11 && /^0[23458]/.test(digits)) {
     digits = '90' + digits.slice(1);
-  } else if (digits.startsWith('5') && digits.length === 10) {
+  } else if (digits.length === 10 && /^[23458]/.test(digits)) {
     digits = '90' + digits;
   }
 

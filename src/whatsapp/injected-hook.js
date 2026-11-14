@@ -18,6 +18,7 @@ export function getBrowserHookScript() {
   var DEFAULT_BRIDGE_BATCH_SAMPLES = 320; // 20ms @ 16kHz mono PCM16
   var MAX_EVENTS = 200;
   var MAX_CAPTURE_CHUNKS = 2000;
+  var MAX_PEER_CONNECTIONS = 50;
 
   var AudioCtx = window.AudioContext || window.webkitAudioContext;
   var outCtx = null;
@@ -26,6 +27,7 @@ export function getBrowserHookScript() {
   var activeSources = new Set();
   var nextPlayTime = 0;
   var keepAliveStarted = false;
+  var outFlushGen = 0;
 
   var inCtx = null;
   var incomingContexts = [];
@@ -38,6 +40,8 @@ export function getBrowserHookScript() {
   var bridgePcmQueue = [];
   var bridgePcmSamples = 0;
   var bridgeFlushTimer = null;
+  var activeWebrtcTrackCount = 0;
+  var webAudioDestCleanups = [];
 
   var state = {
     hookedGetUserMediaCount: 0,
@@ -77,12 +81,13 @@ export function getBrowserHookScript() {
     if (!AudioCtx) {
       throw new Error('AudioContext is not available in this browser environment');
     }
-    if (!outCtx) {
+    if (!outCtx || outCtx.state === 'closed') {
       outCtx = new AudioCtx();
       outGain = outCtx.createGain();
       outGain.__wpJarvisInternal = true;
       outGain.gain.value = 1;
       state.outgoingSampleRate = outCtx.sampleRate || DEFAULT_OUTGOING_RATE;
+      keepAliveStarted = false;
 
       if (!keepAliveStarted) {
         keepAliveStarted = true;
@@ -111,11 +116,51 @@ export function getBrowserHookScript() {
     return { ctx: outCtx, gain: outGain };
   }
 
+  function pruneActiveDestinations() {
+    for (var i = activeDestinations.length - 1; i >= 0; i--) {
+      var d = activeDestinations[i];
+      var tracks = d && d.stream && typeof d.stream.getTracks === 'function'
+        ? d.stream.getTracks()
+        : (d && d.stream && typeof d.stream.getAudioTracks === 'function' ? d.stream.getAudioTracks() : []);
+      var allEnded = tracks.length > 0 && tracks.every(function (t) { return t && t.readyState === 'ended'; });
+      if (allEnded) {
+        try { if (outGain) outGain.disconnect(d); } catch (_) {}
+        activeDestinations.splice(i, 1);
+      }
+    }
+  }
+
   function createSpoofedAudioStream() {
+    pruneActiveDestinations();
     var graph = ensureOutAudioGraph();
     var dest = graph.ctx.createMediaStreamDestination();
     graph.gain.connect(dest);
     activeDestinations.push(dest);
+    var tracks = dest && dest.stream && typeof dest.stream.getTracks === 'function'
+      ? dest.stream.getTracks()
+      : (dest && dest.stream && typeof dest.stream.getAudioTracks === 'function' ? dest.stream.getAudioTracks() : []);
+    var removeDest = function () {
+      var idx = activeDestinations.indexOf(dest);
+      if (idx !== -1) {
+        activeDestinations.splice(idx, 1);
+        try { graph.gain.disconnect(dest); } catch (_) {}
+      }
+    };
+    for (var i = 0; i < tracks.length; i++) {
+      var t = tracks[i];
+      if (t && typeof t.addEventListener === 'function') {
+        try { t.addEventListener('ended', removeDest); } catch (_) {}
+      }
+      if (t && typeof t.stop === 'function' && !t.__wpJarvisWrappedStop) {
+        var origStop = t.stop.bind(t);
+        t.__wpJarvisWrappedStop = true;
+        t.stop = function () {
+          var r = origStop();
+          removeDest();
+          return r;
+        };
+      }
+    }
     return dest.stream;
   }
 
@@ -146,7 +191,7 @@ export function getBrowserHookScript() {
 
   function resampleFloat32(input, fromRate, toRate) {
     if (!input || !input.length) return new Float32Array(0);
-    if (!fromRate || fromRate === toRate) return input;
+    if (!Number.isFinite(fromRate) || fromRate <= 0 || fromRate === toRate) return input;
     var outLen = Math.max(1, Math.round((input.length * toRate) / fromRate));
     var output = new Float32Array(outLen);
     var ratio = (input.length - 1) / Math.max(1, outLen - 1);
@@ -181,7 +226,13 @@ export function getBrowserHookScript() {
     return {
       process: function (input, fromRate) {
         if (!input || !input.length) return new Float32Array(0);
-        var srcRate = fromRate || toRate;
+        if (!Number.isFinite(fromRate) || fromRate <= 0) {
+          fromRate = toRate;
+        }
+        if (!Number.isFinite(fromRate) || fromRate <= 0) {
+          return new Float32Array(0);
+        }
+        var srcRate = fromRate;
         if (lastFromRate && lastFromRate !== srcRate) {
           cursorNum = 0;
           hasPrev = false;
@@ -254,8 +305,13 @@ export function getBrowserHookScript() {
   }
 
   function base64ToInt16(b64) {
-    if (!b64) return new Int16Array(0);
-    var bin = window.atob(b64);
+    if (!b64 || typeof b64 !== 'string') return new Int16Array(0);
+    var bin;
+    try {
+      bin = window.atob(b64);
+    } catch (_) {
+      return new Int16Array(0);
+    }
     var evenBytes = bin.length - (bin.length % 2);
     var bytes = new Uint8Array(evenBytes);
     for (var i = 0; i < evenBytes; i++) {
@@ -313,8 +369,8 @@ export function getBrowserHookScript() {
     return samples.length;
   }
 
-  function flushOutgoingPcm() {
-    var count = activeSources.size;
+  function flushOutgoingPcm(minGen) {
+    outFlushGen = typeof minGen === 'number' && minGen > outFlushGen ? minGen : outFlushGen + 1;
     activeSources.forEach(function (src) {
       try { src.stop(0); } catch (_) {}
       try { src.disconnect(); } catch (_) {}
@@ -322,7 +378,7 @@ export function getBrowserHookScript() {
     activeSources.clear();
     nextPlayTime = 0;
     state.outgoingQueueCount = 0;
-    return count;
+    return outFlushGen;
   }
 
   function clearBridgeBuffer() {
@@ -332,6 +388,14 @@ export function getBrowserHookScript() {
     }
     bridgePcmQueue = [];
     bridgePcmSamples = 0;
+  }
+
+  function runWebAudioDestCleanups() {
+    var list = webAudioDestCleanups.slice();
+    webAudioDestCleanups = [];
+    for (var i = 0; i < list.length; i++) {
+      try { list[i](); } catch (_) {}
+    }
   }
 
   function flushIncomingBridge() {
@@ -390,7 +454,11 @@ export function getBrowserHookScript() {
     }
   }
 
-  function handleIncomingFloatFrame(floatData, fromRate, resampler) {
+  function handleIncomingFloatFrame(floatData, fromRate, resampler, sourceTag) {
+    var tag = typeof resampler === 'string' ? resampler : sourceTag;
+    if (tag && tag.indexOf('webaudio_dest:') === 0 && activeWebrtcTrackCount > 0) {
+      return;
+    }
     if (!floatData || !floatData.length) return;
     var pcm16;
     if (resampler && typeof resampler.process === 'function') {
@@ -431,7 +499,7 @@ export function getBrowserHookScript() {
     enqueueBridgePcm(pcm16);
   }
 
-  function attachScriptProcessorCapture(ctx, source, cleanupList, resampler, sourceTag) {
+  function attachScriptProcessorCapture(ctx, source, cleanupList, resampler, sourceTag, ownsSource) {
     if (typeof ctx.createScriptProcessor !== 'function') return;
     var sr = ctx.sampleRate || 48000;
     var bufSize = sr <= 24000 ? 512 : 2048;
@@ -446,7 +514,7 @@ export function getBrowserHookScript() {
         ? evt.inputBuffer.getChannelData(0)
         : null;
       if (input) {
-        handleIncomingFloatFrame(input, ctx.sampleRate || 48000, resampler);
+        handleIncomingFloatFrame(input, ctx.sampleRate || 48000, resampler, sourceTag);
       }
     };
 
@@ -464,14 +532,19 @@ export function getBrowserHookScript() {
       timestamp: Date.now()
     });
     cleanupList.push(function () {
-      try { source.disconnect(); } catch (_) {}
+      processor.onaudioprocess = null;
+      if (ownsSource) {
+        try { source.disconnect(); } catch (_) {}
+      } else {
+        try { source.disconnect(processor); } catch (_) {}
+      }
       try { processor.disconnect(); } catch (_) {}
       try { zeroGain.disconnect(); } catch (_) {}
     });
   }
 
   function ensureInAudioContext() {
-    if (!inCtx) {
+    if (!inCtx || inCtx.state === 'closed') {
       inCtx = new AudioCtx();
       incomingContexts.push(inCtx);
     }
@@ -548,7 +621,7 @@ export function getBrowserHookScript() {
         silentGain.gain.value = 0;
         workletNode.port.onmessage = function (msg) {
           if (msg && msg.data) {
-            handleIncomingFloatFrame(msg.data, sr, resampler);
+            handleIncomingFloatFrame(msg.data, sr, resampler, sourceTag);
           }
         };
         source.connect(workletNode);
@@ -562,19 +635,22 @@ export function getBrowserHookScript() {
           timestamp: Date.now()
         });
         cleanupNodes.push(function () {
+          if (workletNode.port) workletNode.port.onmessage = null;
           if (ownsSource) {
             try { source.disconnect(); } catch (_) {}
+          } else {
+            try { source.disconnect(workletNode); } catch (_) {}
           }
           try { workletNode.disconnect(); } catch (_) {}
           try { silentGain.disconnect(); } catch (_) {}
         });
       }).catch(function () {
         if (!stateRef || !stateRef.cleaned) {
-          attachScriptProcessorCapture(ctx, source, cleanupNodes, resampler, sourceTag);
+          attachScriptProcessorCapture(ctx, source, cleanupNodes, resampler, sourceTag, ownsSource);
         }
       });
     } else {
-      attachScriptProcessorCapture(ctx, source, cleanupNodes, resampler, sourceTag);
+      attachScriptProcessorCapture(ctx, source, cleanupNodes, resampler, sourceTag, ownsSource);
     }
   }
 
@@ -585,17 +661,33 @@ export function getBrowserHookScript() {
       incomingContexts.push(targetCtx);
     }
     var srcName = (sourceNode.constructor && sourceNode.constructor.name) || 'AudioNode';
+    var cleanupNodes = [];
+    var stateRef = { cleaned: false };
+    function cleanupSourceTap() {
+      if (stateRef.cleaned) return;
+      stateRef.cleaned = true;
+      sourceNode.__wpJarvisTapped = false;
+      for (var i = 0; i < cleanupNodes.length; i++) {
+        try { cleanupNodes[i](); } catch (_) {}
+      }
+      var idx = webAudioDestCleanups.indexOf(cleanupSourceTap);
+      if (idx !== -1) webAudioDestCleanups.splice(idx, 1);
+    }
+    webAudioDestCleanups.push(cleanupSourceTap);
+    if (typeof sourceNode.addEventListener === 'function') {
+      try { sourceNode.addEventListener('ended', cleanupSourceTap); } catch (_) {}
+    }
     attachNodeAudioCapture(
       targetCtx,
       sourceNode,
-      [],
-      { cleaned: false },
+      cleanupNodes,
+      stateRef,
       'webaudio_dest:' + srcName,
       false
     );
   }
 
-  function attachIncomingAudioCapture(event) {
+  function attachIncomingAudioCapture(event, pc) {
     if (!AudioCtx || !event || !event.track || event.track.kind !== 'audio') return;
     try {
       var ctx = ensureInAudioContext();
@@ -604,6 +696,7 @@ export function getBrowserHookScript() {
       function cleanup() {
         if (stateRef.cleaned) return;
         stateRef.cleaned = true;
+        activeWebrtcTrackCount = Math.max(0, activeWebrtcTrackCount - 1);
         flushIncomingBridge();
         for (var i = 0; i < cleanupNodes.length; i++) {
           try { cleanupNodes[i](); } catch (_) {}
@@ -612,11 +705,26 @@ export function getBrowserHookScript() {
       if (typeof event.track.addEventListener === 'function') {
         event.track.addEventListener('ended', cleanup);
       }
+      if (pc && typeof pc.addEventListener === 'function') {
+        var checkPcTerminal = function () {
+          if (
+            pc.connectionState === 'closed' ||
+            pc.connectionState === 'failed' ||
+            pc.iceConnectionState === 'closed' ||
+            pc.iceConnectionState === 'failed'
+          ) {
+            cleanup();
+          }
+        };
+        pc.addEventListener('connectionstatechange', checkPcTerminal);
+        pc.addEventListener('iceconnectionstatechange', checkPcTerminal);
+      }
 
       var stream = (event.streams && event.streams[0]) || (window.MediaStream ? new window.MediaStream([event.track]) : null);
       if (!stream || typeof ctx.createMediaStreamSource !== 'function') return;
       var source = ctx.createMediaStreamSource(stream);
       source.__wpJarvisInternal = true;
+      activeWebrtcTrackCount += 1;
       attachNodeAudioCapture(ctx, source, cleanupNodes, stateRef, 'webrtc_track', true);
     } catch (_) {}
   }
@@ -688,6 +796,9 @@ export function getBrowserHookScript() {
         remoteAudioTracks: 0
       };
       state.peerConnections.push(record);
+      if (state.peerConnections.length > MAX_PEER_CONNECTIONS) {
+        state.peerConnections.shift();
+      }
 
       recordEvent({
         type: 'pc_created',
@@ -742,7 +853,7 @@ export function getBrowserHookScript() {
             kind: kind,
             timestamp: Date.now()
           });
-          attachIncomingAudioCapture(event);
+          attachIncomingAudioCapture(event, pc);
         });
       }
 
@@ -762,7 +873,10 @@ export function getBrowserHookScript() {
 
   window.__wpJarvisAudio = {
     pushOutgoingPcm: pushOutgoingPcm,
-    pushOutgoingBase64Pcm: function (b64, sampleRate) {
+    pushOutgoingBase64Pcm: function (b64, sampleRate, expectedGen) {
+      if (typeof expectedGen === 'number' && expectedGen < outFlushGen) {
+        return 0;
+      }
       return pushOutgoingPcm(base64ToInt16(b64), sampleRate);
     },
     flushOutgoingPcm: flushOutgoingPcm,
@@ -807,6 +921,9 @@ export function getBrowserHookScript() {
           clearBridgeBuffer();
         }
         bridgeStreamingEnabled = nextEnabled;
+        if (!nextEnabled) {
+          runWebAudioDestCleanups();
+        }
       }
     },
     flushIncomingBridge: flushIncomingBridge,
@@ -837,8 +954,11 @@ export function getBrowserHookScript() {
       state.incomingBytesCaptured = 0;
       state.lastIncomingPeak = 0;
       state.lastIncomingRms = 0;
+      outFlushGen = 0;
       capturedIncomingChunks = [];
       clearBridgeBuffer();
+      runWebAudioDestCleanups();
+      pruneActiveDestinations();
     },
     _debugGetIncomingContexts: function () {
       return incomingContexts;

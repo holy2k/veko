@@ -1976,3 +1976,500 @@ test('urgent break and quiet transfer preserve prior buffered delayed messages, 
   assert.equal(store2.getPendingDelayedCall(custCd), null);
   assert.equal(store2.getPendingDelayedCall(custAns), null);
 });
+
+test('preserves pendingCallChatId across other customers ignored, delayed, or quiet-hours messages and clears equivalent identities', async (t) => {
+  const store = await createTempStore(t);
+  const wa = createFakeWhatsApp();
+  let now = Date.parse('2026-11-13T14:00:00+03:00');
+  const custA = '905551110001@c.us';
+  const custB = '905552220002@c.us';
+
+  const orch = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: true,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '09:00',
+      quietHoursResumeMode: 'auto',
+      aiTextProvider: 'none',
+    },
+    store,
+    whatsapp: wa,
+    callController: {
+      isCallActive: () => false,
+      startCallWithOwner: async () => 'answered',
+    },
+    triageMessage: async ({ event }) => {
+      const b = String(event?.body || '');
+      if (b === 'Teşekkürler') {
+        return { priority: 'ignore', reason: 'trivial', summary: b, source: 'rule' };
+      }
+      return { priority: 'normal', reason: 'normal', summary: b, source: 'rule' };
+    },
+    nowFn: () => now,
+    setTimeoutFn: () => ({ id: 1 }),
+    clearTimeoutFn: () => {},
+  });
+
+  // Customer A has a pending call (e.g., from a missed call)
+  store.setPendingCallChatId(custA);
+
+  // 1. Customer B sends a trivial ignored message -> Customer A's pendingCallChatId must be preserved!
+  await orch.handleIncomingMessage({
+    id: 'pend-1',
+    from: custB,
+    phone: '905552220002',
+    fromMe: false,
+    type: 'chat',
+    body: 'Teşekkürler',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.equal(store.getPendingCallChatId(), custA);
+
+  // 2. Customer B sends a normal message that gets smart_delayed -> Customer A's pendingCallChatId must be preserved!
+  await orch.handleIncomingMessage({
+    id: 'pend-2',
+    from: custB,
+    phone: '905552220002',
+    fromMe: false,
+    type: 'chat',
+    body: 'Merhaba fiyat nedir?',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.equal(store.getPendingCallChatId(), custA);
+
+  // 3. During quiet hours, Customer B sends a message -> Customer A's pendingCallChatId must still be preserved!
+  now = Date.parse('2026-11-13T23:00:00+03:00');
+  await orch.handleIncomingMessage({
+    id: 'pend-3',
+    from: custB,
+    phone: '905552220002',
+    fromMe: false,
+    type: 'chat',
+    body: 'Gece mesajı',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.equal(store.getPendingCallChatId(), custA);
+});
+
+test('triage race conditions: clears timer during triage, re-arms on ignore, aborts if owner replied during triage, and schedules smart delay during active call', async (t) => {
+  const store = await createTempStore(t);
+  const wa = createFakeWhatsApp();
+  let now = Date.parse('2026-11-13T15:00:00+03:00');
+  const clearedHandles = [];
+  const armedHandles = [];
+  let activeCallFlag = false;
+  let callsStarted = 0;
+
+  let onTriageStart = null;
+  let releaseTriage = null;
+
+  const orch = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: false,
+      aiTextProvider: 'none',
+    },
+    store,
+    whatsapp: wa,
+    callController: {
+      isCallActive: () => activeCallFlag,
+      startCallWithOwner: async () => {
+        callsStarted += 1;
+        return 'answered';
+      },
+    },
+    triageMessage: async ({ event }) => {
+      if (onTriageStart) {
+        onTriageStart();
+      }
+      if (releaseTriage) {
+        await releaseTriage;
+      }
+      const b = String(event?.body || '');
+      if (b === '👍') return { priority: 'ignore', reason: 'trivial', summary: b, source: 'rule' };
+      if (/acil/i.test(b)) return { priority: 'urgent', reason: 'urgent', summary: b, source: 'rule' };
+      return { priority: 'normal', reason: 'normal', summary: b, source: 'rule' };
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const h = { id: armedHandles.length + 1, delay, fn };
+      armedHandles.push(h);
+      return h;
+    },
+    clearTimeoutFn: (h) => {
+      if (h) clearedHandles.push(h.id);
+    },
+  });
+
+  // 1. Seed a delayed call via normal message, then send '👍' -> timer cleared before triage and re-armed on ignore
+  await orch.handleIncomingMessage({
+    id: 'tr-race-1',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905551112233',
+    fromMe: false,
+    type: 'chat',
+    body: 'İlk mesaj',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.equal(armedHandles.length, 1);
+  let clearedDuringTriage = false;
+  onTriageStart = () => {
+    clearedDuringTriage = clearedHandles.includes(1);
+  };
+  await orch.handleIncomingMessage({
+    id: 'tr-race-2',
+    from: CUSTOMER_CHAT_ID,
+    phone: '905551112233',
+    fromMe: false,
+    type: 'chat',
+    body: '👍',
+    timestamp: Math.floor(now / 1000),
+  });
+  onTriageStart = null;
+  assert.equal(clearedDuringTriage, true);
+  assert.equal(armedHandles.length, 2); // Re-armed!
+
+  // 2. Equivalent identity ('05551112233@c.us') updates the same canonical delayed entry instead of creating a duplicate
+  now += 60_000;
+  await orch.handleIncomingMessage({
+    id: 'tr-race-eq',
+    from: '05551112233@c.us',
+    phone: '05551112233',
+    fromMe: false,
+    type: 'chat',
+    body: 'Ek bilgi',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.deepEqual(Object.keys(store.getPendingDelayedCalls()), [CUSTOMER_CHAT_ID]);
+  assert.equal(store.getPendingDelayedCall(CUSTOMER_CHAT_ID).messages.length, 2);
+
+  // 3. Urgent message arrives, but while triageMessage is awaiting LLM, owner replies fromMe -> aborts call!
+  const custUrg = '905553334444@c.us';
+  let unlockTriage;
+  releaseTriage = new Promise((r) => {
+    unlockTriage = r;
+  });
+  const urgPromise = orch.handleIncomingMessage({
+    id: 'tr-race-3',
+    from: custUrg,
+    phone: '905553334444',
+    fromMe: false,
+    type: 'chat',
+    body: 'Acil bakar mısınız',
+    timestamp: Math.floor(now / 1000),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  // Owner replies while triage is still in flight
+  await orch.handleIncomingMessage({
+    id: 'tr-race-3-owner',
+    from: custUrg,
+    to: custUrg,
+    fromMe: true,
+    type: 'chat',
+    body: 'Bakıyorum hemen',
+    timestamp: Math.floor(now / 1000),
+  });
+  unlockTriage();
+  const urgRes = await urgPromise;
+  releaseTriage = null;
+  assert.equal(urgRes.action, 'ignore');
+  assert.equal(urgRes.reason, 'owner_active_window');
+  assert.equal(callsStarted, 0);
+
+  // 4. Normal message arrives while another call is in progress -> schedules 10-min delayed call instead of dropping it
+  const custDuringCall = '905554445555@c.us';
+  activeCallFlag = true;
+  const duringCallRes = await orch.handleIncomingMessage({
+    id: 'tr-race-4',
+    from: custDuringCall,
+    phone: '905554445555',
+    fromMe: false,
+    type: 'chat',
+    body: 'Fiyat listesi alabilir miyim?',
+    timestamp: Math.floor(now / 1000),
+  });
+  activeCallFlag = false;
+  assert.equal(duringCallRes.reason, 'smart_delayed');
+  assert.ok(store.getPendingDelayedCall(custDuringCall));
+});
+
+test('runScheduledTick retries failed morning/snooze notices, resets awaitingOwnerConfirm on night entry, avoids @lid phone leak, and notifies multi-message silenced entries', async (t) => {
+  const store = await createTempStore(t);
+  let sendShouldFail = true;
+  const wa = createFakeWhatsApp();
+  const origSend = wa.sendMessage.bind(wa);
+  wa.sendMessage = async (chatId, text, options) => {
+    if (sendShouldFail) return null;
+    return origSend(chatId, text, options);
+  };
+
+  let now = Date.parse('2026-11-13T23:00:00+03:00');
+  const lidCustomer = '9988776655@lid';
+
+  const orch = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      callPolicy: 'smart',
+      callDelayMinutes: 10,
+      quietHoursEnabled: true,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '09:00',
+      quietHoursResumeMode: 'auto',
+      aiTextProvider: 'none',
+    },
+    store,
+    whatsapp: wa,
+    callController: { isCallActive: () => false, startCallWithOwner: async () => 'answered' },
+    triageMessage: async ({ event }) => ({
+      priority: 'normal',
+      reason: 'normal',
+      summary: String(event?.body || ''),
+      source: 'rule',
+    }),
+    nowFn: () => now,
+    setTimeoutFn: () => ({ id: 1 }),
+    clearTimeoutFn: () => {},
+  });
+
+  // 1. @lid message during quiet hours without phone should record phone: '' (not LID digits)
+  await orch.handleIncomingMessage({
+    id: 'lid-q-1',
+    from: lidCustomer,
+    fromMe: false,
+    type: 'chat',
+    body: 'Gece mesajı lid',
+    timestamp: Math.floor(now / 1000),
+  });
+  const qItems = store.getQuietQueue();
+  assert.equal(qItems.length, 1);
+  assert.equal(qItems[0].phone, '');
+
+  // 2. At 09:00 when sendMessage fails (returns null), quietQueue is NOT cleared and lastMorningPromptYmd is NOT set
+  now = Date.parse('2026-11-14T09:00:00+03:00');
+  await orch.processScheduledEvents(now);
+  assert.equal(store.getQuietQueue().length, 1);
+  assert.notEqual(store.getQuietScheduleState().lastMorningPromptYmd, '2026-11-14');
+
+  // When sendMessage succeeds on next tick, digest is sent and quietQueue is cleared
+  sendShouldFail = false;
+  await orch.processScheduledEvents(now + 60_000);
+  assert.equal(store.getQuietQueue().length, 0);
+  assert.equal(store.getQuietScheduleState().lastMorningPromptYmd, '2026-11-14');
+
+  // 3. If awaitingOwnerConfirm was left true during day, entering scheduledQuiet at 22:00 resets awaitingOwnerConfirm: false and lastMorningPromptYmd: null
+  store.setQuietScheduleState({
+    awaitingOwnerConfirm: true,
+    wasQuietPendingResume: false,
+    lastMorningPromptYmd: '2026-11-14',
+  });
+  now = Date.parse('2026-11-14T22:05:00+03:00');
+  await orch.processScheduledEvents(now);
+  assert.equal(store.getQuietScheduleState().awaitingOwnerConfirm, false);
+  assert.equal(store.getQuietScheduleState().lastMorningPromptYmd, null);
+  assert.equal(store.getQuietScheduleState().wasQuietPendingResume, true);
+
+  // 4. Multi-message delayed entry maturing while silenced still sends 🔕 summary notice so follow-up messages aren't lost
+  now = Date.parse('2026-11-15T12:00:00+03:00');
+  store.setQuietScheduleState({
+    awaitingOwnerConfirm: false,
+    wasQuietPendingResume: false,
+    resumeConfirmedYmd: '2026-11-15',
+  });
+  const custSil = '905556667777@c.us';
+  store.upsertPendingDelayedCall({
+    chatId: custSil,
+    customerName: 'Çoklu Mesaj Müşteri',
+    dueAtMs: now - 1000,
+    messages: ['Mesaj 1', 'Mesaj 2 eklendi'],
+  });
+  store.setSilencedUntil(now + 600_000);
+  const sentBeforeSilTick = wa.sent.length;
+  await orch.processScheduledEvents(now);
+  const sentAfterSilTick = wa.sent.slice(sentBeforeSilTick);
+  assert.equal(sentAfterSilTick.length, 1);
+  assert.match(sentAfterSilTick[0].text, /Mesaj 1.*Mesaj 2 eklendi/);
+});
+
+test('devam resumes awaitingOwnerConfirm/snooze, ara uses customer history/pending summary and chat name instead of "ara", deterministic morning confirm works with AI text enabled, and startLiveForCall guards duplicate connect & hangs up before notice', async (t) => {
+  const store = await createTempStore(t);
+  let now = Date.parse('2026-11-14T09:05:00+03:00');
+  const wa = createFakeWhatsApp({
+    contactsList: [{ name: 'Kemal Kaya', phone: '905551112233', chatId: CUSTOMER_CHAT_ID }],
+    historyByChat: {
+      [CUSTOMER_CHAT_ID]: [
+        { id: 'h1', fromMe: false, body: 'Gerçek müşteri sorusu nedir?', type: 'chat', timestamp: 1700001 },
+      ],
+    },
+  });
+  wa.getChatById = async (id) => (id === CUSTOMER_CHAT_ID ? { name: 'Kemal Kaya (Chat)' } : null);
+
+  const liveContexts = [];
+  let startLiveCount = 0;
+  let shouldFailLive = false;
+  const actionOrder = [];
+
+  const origSend = wa.sendMessage.bind(wa);
+  wa.sendMessage = async (chatId, text, options) => {
+    actionOrder.push(`sendMessage:${text.slice(0, 15)}`);
+    return origSend(chatId, text, options);
+  };
+
+  let textTurns = 0;
+  const orch = createOrchestrator({
+    config: {
+      ...createBaseConfig(),
+      quietHoursEnabled: true,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '09:00',
+      quietHoursResumeMode: 'ask',
+      aiText: { provider: 'gemini', apiKey: 'test', model: 'gemini-3.8-flash' },
+    },
+    store,
+    whatsapp: wa,
+    callController: {
+      isCallActive: () => false,
+      startCallWithOwner: async (callbacks) => {
+        let resolveDone;
+        const done = new Promise((r) => {
+          resolveDone = r;
+        });
+        const session = {
+          done,
+          pushAudioToOwner() {},
+          flushAudioToOwner() {},
+          hangUp: async (reason) => {
+            actionOrder.push(`hangUp:${reason}`);
+            callbacks.onEnded?.('answered', { reason });
+            resolveDone('answered');
+          },
+        };
+        // Trigger onConnected twice to verify duplicate guard
+        await callbacks.onConnected(session);
+        await callbacks.onConnected(session);
+        if (!shouldFailLive) {
+          resolveDone('answered');
+        }
+        return session;
+      },
+    },
+    startLiveSession: async ({ customerContext }) => {
+      startLiveCount += 1;
+      if (shouldFailLive) {
+        throw new Error('Live connection boom');
+      }
+      liveContexts.push(customerContext);
+      return { sendOwnerAudio() {}, close() {} };
+    },
+    runTextTurn: async () => {
+      textTurns += 1;
+      return { ok: true, text: 'LLM yanıtı' };
+    },
+    nowFn: () => now,
+  });
+
+  // 1. Default version fallback in durum is v0.2.2 when appVersion is not set
+  await orch.handleIncomingMessage({
+    id: 'ver-1',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'durum',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.match(wa.sent.at(-1).text, /v0\.2\.2/);
+
+  // 2. Deterministic morning confirm ("evet") works without calling runTextTurn even when AI text is enabled
+  store.setQuietScheduleState({
+    awaitingOwnerConfirm: true,
+    wasQuietPendingResume: false,
+    lastMorningPromptYmd: '2026-11-14',
+  });
+  store.enqueueQuietMessage({
+    chatId: CUSTOMER_CHAT_ID,
+    customerName: 'Kemal Kaya',
+    phone: '905551112233',
+    priority: 'normal',
+    summary: 'Gece sorusu',
+    latestMessage: 'Gece sorusu',
+    atMs: now - 3600_000,
+  });
+  await orch.handleIncomingMessage({
+    id: 'det-yes',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'evet',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.equal(textTurns, 0);
+  assert.equal(store.getQuietScheduleState().awaitingOwnerConfirm, false);
+  assert.equal(store.getQuietQueue().length, 0);
+
+  // 3. "devam" command also clears awaitingOwnerConfirm/snoozeActive and flushes quietQueue
+  store.setQuietScheduleState({
+    awaitingOwnerConfirm: true,
+    snoozedUntilMs: now + 1800_000,
+    pendingSnoozeDigest: true,
+  });
+  store.enqueueQuietMessage({
+    chatId: CUSTOMER_CHAT_ID,
+    customerName: 'Kemal Kaya',
+    phone: '905551112233',
+    priority: 'normal',
+    summary: 'Erteleme sorusu',
+    latestMessage: 'Erteleme sorusu',
+    atMs: now - 1000,
+  });
+  await orch.handleIncomingMessage({
+    id: 'cmd-devam-quiet',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'devam',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.equal(store.getQuietScheduleState().awaitingOwnerConfirm, false);
+  assert.equal(store.getQuietScheduleState().snoozedUntilMs, null);
+  assert.equal(store.getQuietQueue().length, 0);
+  assert.match(wa.sent.at(-1).text, /Erteleme sorusu/);
+
+  // 4. "ara" (call_latest) resolves customerName via getChatById and uses customer's last message instead of "ara", while duplicate onConnected only starts 1 live session
+  store.setPendingCallChatId(CUSTOMER_CHAT_ID);
+  await orch.handleIncomingMessage({
+    id: 'cmd-ara-latest',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'ara',
+    timestamp: Math.floor(now / 1000),
+  });
+  assert.equal(startLiveCount, 1);
+  assert.equal(liveContexts[0].customerName, 'Kemal Kaya (Chat)');
+  assert.equal(liveContexts[0].triggerMessage, 'Gerçek müşteri sorusu nedir?');
+
+  // 5. When startLiveSession fails, requestCallHangup runs BEFORE sendOwnerNotice
+  actionOrder.length = 0;
+  shouldFailLive = true;
+  await orch.handleIncomingMessage({
+    id: 'cmd-ara-query',
+    from: OWNER_CHAT_ID,
+    phone: '905550000100',
+    fromMe: false,
+    type: 'chat',
+    body: 'ara Kemal',
+    timestamp: Math.floor(now / 1000),
+  });
+  const hangupIdx = actionOrder.findIndex((x) => x.startsWith('hangUp:live_session_start_failed'));
+  const noticeIdx = actionOrder.findIndex((x) => x.startsWith('sendMessage:⚠️'));
+  assert.ok(hangupIdx !== -1 && noticeIdx !== -1 && hangupIdx < noticeIdx);
+});
+

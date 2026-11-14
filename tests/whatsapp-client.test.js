@@ -1020,10 +1020,14 @@ test('spike-webrtc-call DOM inspection scopes timer/status to call container, pr
     querySelector: (s) => rootBtnHangup.querySelector(s),
     querySelectorAll: (s) => rootBtnHangup.querySelectorAll(s),
   };
+  const btnHangupRingingState = analyzeCallDomFromDocument(HANGUP_SELECTORS, docBtnHangup);
+  assert.equal(btnHangupRingingState.hangupPresent, true);
+  assert.equal(btnHangupRingingState.timerText, null, 'fallback timer suppressed while ringing');
+  assert.deepEqual(btnHangupRingingState.statusHints, ['Aranıyor']);
+  dialogBtnHangup.innerText = 'Ahmet\n00:05\nAramayı sonlandır';
   const btnHangupState = analyzeCallDomFromDocument(HANGUP_SELECTORS, docBtnHangup);
   assert.equal(btnHangupState.hangupPresent, true);
   assert.equal(btnHangupState.timerText, '00:05');
-  assert.deepEqual(btnHangupState.statusHints, ['Aranıyor']);
 
   // 6b: Nested <span data-icon="call-end"> inside <button aria-label="End call"> inside intermediate controls wrapper inside [role="dialog"]
   const rootNested = makeEl({ id: 'app', matchFn: realisticMatch });
@@ -1058,10 +1062,14 @@ test('spike-webrtc-call DOM inspection scopes timer/status to call container, pr
     querySelector: (s) => rootNested.querySelector(s),
     querySelectorAll: (s) => rootNested.querySelectorAll(s),
   };
+  const nestedRingingState = analyzeCallDomFromDocument(HANGUP_SELECTORS, docNested);
+  assert.equal(nestedRingingState.hangupPresent, true);
+  assert.equal(nestedRingingState.timerText, null);
+  assert.deepEqual(nestedRingingState.statusHints, ['Ringing']);
+  dialogNested.innerText = 'Ahmet\n00:05\nEnd call';
   const nestedState = analyzeCallDomFromDocument(HANGUP_SELECTORS, docNested);
   assert.equal(nestedState.hangupPresent, true);
   assert.equal(nestedState.timerText, '00:05');
-  assert.deepEqual(nestedState.statusHints, ['Ringing']);
 
   // 6c: <div role="button" aria-label="End call"> inside an unnamed call overlay card (no role="dialog")
   const rootRoleBtn = makeEl({ id: 'app', matchFn: realisticMatch });
@@ -1088,10 +1096,14 @@ test('spike-webrtc-call DOM inspection scopes timer/status to call container, pr
     querySelector: (s) => rootRoleBtn.querySelector(s),
     querySelectorAll: (s) => rootRoleBtn.querySelectorAll(s),
   };
+  const roleBtnRingingState = analyzeCallDomFromDocument(HANGUP_SELECTORS, docRoleBtn);
+  assert.equal(roleBtnRingingState.hangupPresent, true);
+  assert.equal(roleBtnRingingState.timerText, null);
+  assert.deepEqual(roleBtnRingingState.statusHints, ['Aranıyor']);
+  cardOverlay.innerText = 'Ahmet\n00:05\nEnd call';
   const roleBtnState = analyzeCallDomFromDocument(HANGUP_SELECTORS, docRoleBtn);
   assert.equal(roleBtnState.hangupPresent, true);
   assert.equal(roleBtnState.timerText, '00:05');
-  assert.deepEqual(roleBtnState.statusHints, ['Aranıyor']);
 });
 
 test('createWhatsAppClient preserves native browser UA (userAgent: false) and retries mainFrame startup race', async () => {
@@ -1938,3 +1950,220 @@ test('review fixes: listRecentChats emits timestampIso (+03:00) and scanCustomer
   assert.equal(scanRes.excludedThirdPartyCount, 1);
   assert.equal(scanRes.excludedOutboundOnlyCount, 1);
 });
+
+test('client deduplicates @lid + @c.us chats in listRecentChats and scanCustomerChats, resolves owner @lid once, falls back to getChatById, and deduplicates hookRegisteredPages', async () => {
+  const nowSec = Math.floor(Date.UTC(2026, 4, 15, 9, 0, 0) / 1000);
+  const nowMs = nowSec * 1000;
+  const rangeStartMs = nowMs - 86400_000;
+  const rangeEndMs = nowMs + 86400_000;
+
+  let evalOnNewDocCalls = 0;
+  let ownerLidLookups = 0;
+  const waCallListeners = new Map();
+  const fakeWaCallCol = {
+    activeCall: null,
+    on(evt, fn) {
+      if (!waCallListeners.has(evt)) waCallListeners.set(evt, []);
+      waCallListeners.get(evt).push(fn);
+    },
+    emit(evt, ...args) {
+      for (const fn of waCallListeners.get(evt) || []) fn(...args);
+    },
+  };
+
+  const vmContext = {
+    window: null,
+    require: (name) => (name === 'WAWebCallCollection' ? fakeWaCallCol : null),
+    String,
+    Boolean,
+    Object,
+  };
+  vmContext.window = vmContext;
+  vm.createContext(vmContext);
+
+  const mockPage = {
+    async evaluateOnNewDocument() {
+      evalOnNewDocCalls += 1;
+    },
+    async exposeFunction(name, fn) {
+      vmContext[name] = fn;
+    },
+    async evaluate(fn, ...args) {
+      if (typeof fn === 'string') return vm.runInContext(fn, vmContext);
+      vmContext.__args = args;
+      const src = fn.toString();
+      const expr = /^\s*(async\s+)?function\b|^\s*(async\s+)?\(/.test(src) ? `(${src})` : `(function ${src})`;
+      return vm.runInContext(`${expr}.apply(null, __args)`, vmContext);
+    },
+  };
+
+  const mockChats = [
+    // Person 1: has BOTH @lid and @c.us chats -> should deduplicate into 1 entry, merge unreadCount (2+3=5), keep max timestamp
+    {
+      id: { _serialized: '111222333@lid' },
+      name: 'Zeynep LID',
+      isGroup: false,
+      unreadCount: 2,
+      timestamp: nowSec - 60,
+      lastMessage: { body: 'Eski mesaj', timestamp: nowSec - 60, fromMe: false },
+      async fetchMessages() {
+        return [{ id: { _serialized: 'm-1' }, fromMe: false, timestamp: nowSec - 60, body: 'Eski mesaj' }];
+      },
+    },
+    {
+      id: { _serialized: '905559998877@c.us' },
+      name: 'Zeynep',
+      isGroup: false,
+      unreadCount: 3,
+      timestamp: nowSec,
+      lastMessage: { body: 'Yeni mesaj', timestamp: nowSec, fromMe: false },
+      async fetchMessages() {
+        return [{ id: { _serialized: 'm-2' }, fromMe: false, timestamp: nowSec, body: 'Yeni mesaj' }];
+      },
+    },
+    // Person 2: supplier whose thirdPartyOutreachUntil is stored under rawId ('444555666@lid') while resolved to '905558887766@c.us'
+    {
+      id: { _serialized: '444555666@lid' },
+      name: 'Tedarikçi LID',
+      isGroup: false,
+      unreadCount: 1,
+      timestamp: nowSec - 10,
+      lastMessage: { body: 'Kargo çıktı', timestamp: nowSec - 10, fromMe: false },
+      async fetchMessages() {
+        throw new Error('supplier with thirdPartyOutreachUntil on rawId must not be fetched');
+      },
+    },
+    // Unresolved @lid chats (to verify owner @lid reverse lookup is called only once before the loop)
+    {
+      id: { _serialized: '777000111@lid' },
+      name: 'Bilinmeyen 1',
+      isGroup: false,
+      unreadCount: 0,
+      timestamp: nowSec - 20,
+      lastMessage: { body: 'Selam 1', timestamp: nowSec - 20, fromMe: false },
+      async fetchMessages() {
+        return [{ id: { _serialized: 'm-u1' }, fromMe: false, timestamp: nowSec - 20, body: 'Selam 1' }];
+      },
+    },
+    {
+      id: { _serialized: '777000222@lid' },
+      name: 'Bilinmeyen 2',
+      isGroup: false,
+      unreadCount: 0,
+      timestamp: nowSec - 30,
+      lastMessage: { body: 'Selam 2', timestamp: nowSec - 30, fromMe: false },
+      async fetchMessages() {
+        return [{ id: { _serialized: 'm-u2' }, fromMe: false, timestamp: nowSec - 30, body: 'Selam 2' }];
+      },
+    },
+  ];
+
+  let clientRef = null;
+  class FakeLocalAuth {}
+  class FakeClient extends EventEmitter {
+    constructor() {
+      super();
+      this.pupPage = mockPage;
+      clientRef = this;
+    }
+    async initialize() {}
+    async destroy() {}
+    async getChats() {
+      return mockChats;
+    }
+    async getContactLidAndPhone(ids) {
+      if (ids.length === 1 && ids[0] === '905321112233@c.us') {
+        ownerLidLookups += 1;
+        return [{ lid: '999999999@lid', pn: '905321112233@c.us' }];
+      }
+      return ids.map((lid) => {
+        if (lid === '111222333@lid') return { lid, pn: '905559998877@c.us' };
+        if (lid === '444555666@lid') return { lid, pn: '905558887766@c.us' };
+        return { lid, pn: '' };
+      });
+    }
+    async getContactById() {
+      // Return contact with no name so normalizeIncomingMessage must fall back to getChatById
+      return { id: { _serialized: '905551112233@c.us' } };
+    }
+    async getChatById(id) {
+      if (id === '905551112233@c.us') {
+        return { id: { _serialized: id }, name: 'Sohbet Adı Fallback' };
+      }
+      return null;
+    }
+  }
+
+  const messages = [];
+  const endedCalls = [];
+  const adapter = createWhatsAppClient(
+    { ownerChatId: '905321112233@c.us', ownerPhone: '905321112233' },
+    {
+      onMessage: (m) => messages.push(m),
+      onIncomingCallEnded: (id) => endedCalls.push(id),
+    },
+    { Client: FakeClient, LocalAuth: FakeLocalAuth }
+  );
+
+  // 1. ensureHookInjected deduplicates evaluateOnNewDocument per page
+  await adapter.initialize();
+  clientRef.emit('ready');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(evalOnNewDocCalls, 1, 'evaluateOnNewDocument must be called at most once per page');
+
+  // 2. listRecentChats deduplicates @lid + @c.us for Zeynep
+  const recent = await adapter.listRecentChats(10);
+  const zeynepEntries = recent.filter((r) => r.chatId === '905559998877@c.us');
+  assert.equal(zeynepEntries.length, 1, 'Zeynep @lid and @c.us must be deduplicated in listRecentChats');
+  assert.equal(zeynepEntries[0].unreadCount, 5, 'unreadCount merged (2 + 3)');
+  assert.equal(zeynepEntries[0].timestamp, nowSec);
+  assert.equal(zeynepEntries[0].lastMessage.body, 'Yeni mesaj');
+
+  // 3. scanCustomerChats deduplicates @lid + @c.us, checks rawId for thirdPartyOutreachUntil, and resolves owner @lid once
+  const store = {
+    getChatState(id) {
+      if (id === '444555666@lid') {
+        return { thirdPartyOutreachUntil: nowMs + 3600_000 };
+      }
+      return {};
+    },
+  };
+  const scanRes = await adapter.scanCustomerChats({
+    rangeStartMs,
+    rangeEndMs,
+    nowMs,
+    store,
+  });
+  assert.equal(ownerLidLookups, 1, 'owner @lid reverse lookup must run once before the loop, not per @lid chat');
+  assert.equal(scanRes.excludedThirdPartyCount, 1, 'thirdPartyOutreachUntil on rawId must exclude supplier');
+  const zeynepScanned = scanRes.customers.filter((c) => c.chatId === '905559998877@c.us');
+  assert.equal(zeynepScanned.length, 1, 'Zeynep @lid and @c.us must be deduplicated in scanCustomerChats');
+  assert.equal(zeynepScanned[0].messageCountInRange, 2, 'messages from both @lid and @c.us threads are combined');
+
+  // 4. normalizeIncomingMessage (fromMe: true) falls back to getChatById when getContactById has no name
+  clientRef.emit('message_create', {
+    id: { _serialized: 'true_905551112233@c.us_1' },
+    from: '908500000000@c.us',
+    to: '905551112233@c.us',
+    fromMe: true,
+    type: 'chat',
+    body: 'Merhaba',
+    timestamp: nowSec,
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].senderName, 'Sohbet Adı Fallback');
+
+  // 5. ensureIncomingCallObserver emits __wpJarvisOnWaCallEnded when an incoming call transitions to outgoing call
+  fakeWaCallCol.activeCall = {
+    attributes: { id: 'inc-99', peerJid: '905321112233@c.us', outgoing: false },
+  };
+  fakeWaCallCol.emit('change:activeCall', fakeWaCallCol.activeCall);
+  fakeWaCallCol.activeCall = {
+    attributes: { id: 'out-100', peerJid: '905321112233@c.us', outgoing: true },
+  };
+  fakeWaCallCol.emit('change:activeCall', fakeWaCallCol.activeCall);
+  await new Promise((r) => setTimeout(r, 15));
+  assert.deepEqual(endedCalls, ['inc-99']);
+});
+

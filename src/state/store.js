@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { phonesMatch } from '../utils/phone.js';
 
 const MAX_BOT_MESSAGE_IDS = 500;
 const MAX_PENDING_DELAYED_CALLS = 100;
@@ -186,7 +187,27 @@ export function createStateStore(filePath) {
 
     const tmpPath = `${resolvedPath}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     fs.writeFileSync(tmpPath, payload, 'utf-8');
-    fs.renameSync(tmpPath, resolvedPath);
+    try {
+      fs.renameSync(tmpPath, resolvedPath);
+    } catch (err) {
+      if (err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EBUSY')) {
+        try {
+          fs.copyFileSync(tmpPath, resolvedPath);
+        } catch {
+          fs.writeFileSync(resolvedPath, payload, 'utf-8');
+        }
+      } else {
+        throw err;
+      }
+    } finally {
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {
+        // Ignore temp file cleanup errors
+      }
+    }
   }
 
   return {
@@ -425,18 +446,37 @@ export function createStateStore(filePath) {
       const chatId = String(item.chatId);
       const atMs = Number.isFinite(item.atMs) ? item.atMs : Date.now();
       const incomingPriority = String(item.priority || 'normal');
-      const existingIdx = quietQueue.findIndex((q) => q.chatId === chatId);
+      const existingIdx = quietQueue.findIndex(
+        (q) =>
+          q.chatId === chatId ||
+          (q.phone && item.phone && phonesMatch(q.phone, item.phone)) ||
+          (!q.chatId.endsWith('@lid') && !chatId.endsWith('@lid') && phonesMatch(q.chatId, chatId))
+      );
 
       if (existingIdx >= 0) {
         const prev = quietQueue[existingIdx];
         const prevRank = PRIORITY_RANK[prev.priority] ?? 1;
         const newRank = PRIORITY_RANK[incomingPriority] ?? 1;
+        const prevClean = String(prev.summary || '')
+          .replace(/^\(\d+\s*mesaj\)\s*/i, '')
+          .trim();
+        const incomingClean = String(item.summary || '')
+          .replace(/^\(\d+\s*mesaj\)\s*/i, '')
+          .trim();
+        const mergedSummary =
+          prevClean && incomingClean
+            ? prevClean.includes(incomingClean)
+              ? prevClean
+              : incomingClean.includes(prevClean)
+                ? incomingClean
+                : `${prevClean} | ${incomingClean}`
+            : prevClean || incomingClean;
         const next = {
           ...prev,
           customerName: String(item.customerName || prev.customerName || chatId),
           phone: String(item.phone || prev.phone || ''),
           priority: newRank >= prevRank ? incomingPriority : prev.priority,
-          summary: String(item.summary || prev.summary || ''),
+          summary: mergedSummary,
           latestMessage: String(item.latestMessage || prev.latestMessage || ''),
           messageCount: (Number(prev.messageCount) || 1) + 1,
           lastAtMs: atMs,

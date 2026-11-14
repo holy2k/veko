@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -114,6 +113,14 @@ export function selectClickableCandidate(selectors, rootDoc, shouldClick = false
   const doc = rootDoc || (typeof document !== 'undefined' ? document : null);
   if (!doc) return null;
 
+  const audioCallSelectors = [
+    '[data-icon="audio-call"]',
+    '[data-icon="voice-call"]',
+    '[aria-label*="Sesli arama" i]',
+    '[aria-label*="Audio call" i]',
+    '[aria-label*="Voice call" i]',
+  ];
+
   const visibleMatches = [];
   for (const sel of selectors) {
     const nodes = doc.querySelectorAll
@@ -122,6 +129,14 @@ export function selectClickableCandidate(selectors, rootDoc, shouldClick = false
     for (const el of nodes) {
       const clickable = el.closest?.('button, [role="button"]') || el;
       if (clickable.closest?.('#pane-side')) continue;
+      if (
+        clickable.disabled === true ||
+        clickable.getAttribute?.('aria-disabled') === 'true' ||
+        el.disabled === true ||
+        el.getAttribute?.('aria-disabled') === 'true'
+      ) {
+        continue;
+      }
       const rect = typeof clickable.getBoundingClientRect === 'function'
         ? clickable.getBoundingClientRect()
         : { width: 1, height: 1 };
@@ -135,7 +150,10 @@ export function selectClickableCandidate(selectors, rootDoc, shouldClick = false
   }
 
   if (!visibleMatches.length) return null;
-  const chosen = visibleMatches.find((m) => m.inHeader) || visibleMatches[0];
+  const preferHeader = visibleMatches.some((m) => audioCallSelectors.includes(m.matchedSelector));
+  const chosen =
+    (preferHeader && visibleMatches.find((m) => m.inHeader && audioCallSelectors.includes(m.matchedSelector))) ||
+    visibleMatches[0];
   if (shouldClick && typeof chosen.clickable.click === 'function') {
     chosen.clickable.click();
   }
@@ -155,6 +173,36 @@ export function analyzeCallDomFromDocument(hangupSels, rootDoc) {
   if (!doc) {
     return { hangupPresent: false, timerText: null, statusHints: [], hasCallContainer: false };
   }
+
+  const keywords = [
+    'Aranıyor',
+    'Çalıyor',
+    'Ringing',
+    'Calling',
+    'Reddedildi',
+    'Declined',
+    'Cevap yok',
+    'No answer',
+    'Meşgul',
+    'Busy',
+    'Bağlanıyor',
+    'Connecting',
+    'Arama bitti',
+    'Call ended',
+  ];
+  const ringingOrConnectingHints = [
+    'Aranıyor',
+    'Çalıyor',
+    'Ringing',
+    'Calling',
+    'Bağlanıyor',
+    'Connecting',
+  ];
+
+  const hasCallKeywords = (text) => {
+    const low = String(text || '').toLowerCase();
+    return keywords.some((kw) => low.includes(kw.toLowerCase()));
+  };
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -266,9 +314,29 @@ export function analyzeCallDomFromDocument(hangupSels, rootDoc) {
         !el.closest?.('#main, #pane-side')
     );
     const voipMatch = overlayCandidates.find((el) => el.matches?.('[data-testid*="voip-container" i]'));
-    const dialogMatch = overlayCandidates.find((el) => el.matches?.('[role="dialog"]'));
-    const nonEmptyMatch = overlayCandidates.find((el) => Boolean(String(el.innerText ?? el.textContent ?? '').trim()));
-    const siblingContainer = voipMatch || dialogMatch || nonEmptyMatch || overlayCandidates[0] || null;
+    const dialogMatch = overlayCandidates.find(
+      (el) =>
+        el.matches?.('[role="dialog"]') &&
+        (hangupPresent ||
+          el.matches?.('[data-testid*="voip-container" i]') ||
+          hasCallKeywords(el.innerText ?? el.textContent ?? ''))
+    );
+    const nonEmptyMatch = overlayCandidates.find(
+      (el) =>
+        Boolean(String(el.innerText ?? el.textContent ?? '').trim()) &&
+        (hangupPresent ||
+          !el.matches?.('[role="dialog"]') ||
+          el.matches?.('[data-testid*="voip-container" i]') ||
+          hasCallKeywords(el.innerText ?? el.textContent ?? ''))
+    );
+    const fallbackCandidate = overlayCandidates.find(
+      (el) =>
+        hangupPresent ||
+        !el.matches?.('[role="dialog"]') ||
+        el.matches?.('[data-testid*="voip-container" i]') ||
+        hasCallKeywords(el.innerText ?? el.textContent ?? '')
+    );
+    const siblingContainer = voipMatch || dialogMatch || nonEmptyMatch || fallbackCandidate || null;
     if (voipMatch || dialogMatch || !callContainer) {
       callContainer = siblingContainer || callContainer;
     } else if (!currentContainerText && siblingContainer) {
@@ -286,6 +354,28 @@ export function analyzeCallDomFromDocument(hangupSels, rootDoc) {
   }
 
   const containerText = String(callContainer.innerText ?? callContainer.textContent ?? '');
+  const lower = containerText.toLowerCase();
+  const statusHints = [];
+  for (const kw of keywords) {
+    if (lower.includes(kw.toLowerCase())) {
+      statusHints.push(kw);
+    }
+  }
+
+  if (
+    !hangupPresent &&
+    Boolean(callContainer.matches?.('[role="dialog"]')) &&
+    !callContainer.matches?.('[data-testid*="voip-container" i]') &&
+    statusHints.length === 0
+  ) {
+    return {
+      hangupPresent: false,
+      timerText: null,
+      statusHints: [],
+      hasCallContainer: false,
+    };
+  }
+
   const lines = containerText
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -298,34 +388,13 @@ export function analyzeCallDomFromDocument(hangupSels, rootDoc) {
         )
       : null);
   const timerNodeText = String(timerEl?.innerText ?? timerEl?.textContent ?? '').trim();
+  const isRingingOrConnecting = statusHints.some((h) =>
+    ringingOrConnectingHints.includes(h)
+  );
   const timerText =
-    (/^\d{1,2}:\d{2}$/.test(timerNodeText) ? timerNodeText : null) ||
-    lines.find((line) => /^(?:0?\d):\d{2}$/.test(line)) ||
+    (/^(?:\d{1,2}:)?\d{1,2}:\d{2}$/.test(timerNodeText) ? timerNodeText : null) ||
+    (!isRingingOrConnecting ? lines.find((line) => /^(?:0?\d):\d{2}$/.test(line)) : null) ||
     null;
-
-  const keywords = [
-    'Aranıyor',
-    'Çalıyor',
-    'Ringing',
-    'Calling',
-    'Reddedildi',
-    'Declined',
-    'Cevap yok',
-    'No answer',
-    'Meşgul',
-    'Busy',
-    'Bağlanıyor',
-    'Connecting',
-    'Arama bitti',
-    'Call ended',
-  ];
-  const lower = containerText.toLowerCase();
-  const statusHints = [];
-  for (const kw of keywords) {
-    if (lower.includes(kw.toLowerCase())) {
-      statusHints.push(kw);
-    }
-  }
 
   return {
     hangupPresent,
@@ -373,12 +442,17 @@ async function inspectCallDomState(page, hangupSelectors) {
 }
 
 async function runSpike() {
+  await import('dotenv/config');
   let config;
   try {
-    config = loadConfig(process.env);
+    config = loadConfig({
+      AI_VOICE_PROVIDER: 'none',
+      AI_TEXT_PROVIDER: 'none',
+      ...process.env,
+    });
   } catch (err) {
     console.error(`[spike] Configuration error: ${err.message}`);
-    console.error('[spike] Set OWNER_PHONE and GEMINI_API_KEY in .env before running npm run spike.');
+    console.error('[spike] Set OWNER_PHONE in .env before running npm run spike.');
     process.exitCode = 1;
     return;
   }

@@ -1,6 +1,56 @@
-import { phonesMatch } from '../utils/phone.js';
+import { phonesMatch, stripJidDeviceTag, toWhatsAppId } from '../utils/phone.js';
 import { formatMessageBody } from '../whatsapp/media-format.js';
 import { resolveCallSettings } from './settings.js';
+import { isSameChatIdentity } from '../ai/tools.js';
+
+function maxTimestamp(a, b) {
+  const hasA = typeof a === 'number' && Number.isFinite(a);
+  const hasB = typeof b === 'number' && Number.isFinite(b);
+  if (hasA && hasB) return Math.max(a, b);
+  if (hasA) return a;
+  if (hasB) return b;
+  return undefined;
+}
+
+function mergeChatStates(lidState = {}, phoneState = {}) {
+  const a = lidState || {};
+  const b = phoneState || {};
+  const merged = { ...b, ...a };
+
+  const thirdPartyOutreachUntil = maxTimestamp(
+    a.thirdPartyOutreachUntil,
+    b.thirdPartyOutreachUntil
+  );
+  if (thirdPartyOutreachUntil !== undefined) {
+    merged.thirdPartyOutreachUntil = thirdPartyOutreachUntil;
+  }
+
+  const lastTextReplyAt = maxTimestamp(a.lastTextReplyAt, b.lastTextReplyAt);
+  if (lastTextReplyAt !== undefined) {
+    merged.lastTextReplyAt = lastTextReplyAt;
+  }
+
+  const lastOwnerReplyAt = maxTimestamp(a.lastOwnerReplyAt, b.lastOwnerReplyAt);
+  if (lastOwnerReplyAt !== undefined) {
+    merged.lastOwnerReplyAt = lastOwnerReplyAt;
+  }
+
+  const aCallAt =
+    typeof a.lastCallAt === 'number' && Number.isFinite(a.lastCallAt) ? a.lastCallAt : -1;
+  const bCallAt =
+    typeof b.lastCallAt === 'number' && Number.isFinite(b.lastCallAt) ? b.lastCallAt : -1;
+  if (bCallAt > aCallAt) {
+    merged.lastCallAt = b.lastCallAt;
+    merged.lastCallStatus = b.lastCallStatus;
+    merged.missedRetryCount = b.missedRetryCount ?? 0;
+  } else if (aCallAt >= 0) {
+    merged.lastCallAt = a.lastCallAt;
+    merged.lastCallStatus = a.lastCallStatus;
+    merged.missedRetryCount = a.missedRetryCount ?? 0;
+  }
+
+  return merged;
+}
 
 /**
  * Checks whether an incoming message belongs to a non-individual chat
@@ -117,9 +167,10 @@ export function evaluateIncomingMessage(event, deps = {}) {
   }
 
   const summaryText = formatMessageBody(event);
-  const targetChatId = event.fromMe
+  const rawTargetChatId = event.fromMe
     ? event.to || event.chatId || event.from
     : event.chatId || event.from;
+  const targetChatId = stripJidDeviceTag(rawTargetChatId);
 
   // 3. Check if message is from or addressed to Owner
   const rawFromLower = String(event.from || '').trim().toLowerCase();
@@ -129,7 +180,10 @@ export function evaluateIncomingMessage(event, deps = {}) {
       Boolean(event.phone && phonesMatch(event.phone, config.ownerPhone)));
   const isFromOwner =
     isIncomingFromOwner ||
-    (event.fromMe && phonesMatch(targetChatId, config.ownerPhone));
+    (event.fromMe &&
+      ((!String(targetChatId).toLowerCase().endsWith('@lid') &&
+        phonesMatch(targetChatId, config.ownerPhone)) ||
+        Boolean(event.phone && phonesMatch(event.phone, config.ownerPhone))));
 
   if (isFromOwner) {
     const textToParse = typeof event.body === 'string' ? event.body : summaryText;
@@ -172,7 +226,7 @@ export function evaluateIncomingMessage(event, deps = {}) {
         lastOwnerReplyAt: nowMs,
         missedRetryCount: 0,
       });
-      if (store.getPendingCallChatId() === targetChatId) {
+      if (isSameChatIdentity(store.getPendingCallChatId?.(), targetChatId)) {
         store.setPendingCallChatId(null);
       }
     }
@@ -184,11 +238,18 @@ export function evaluateIncomingMessage(event, deps = {}) {
   }
 
   // 5. Customer message evaluation
-  const chatState = store ? store.getChatState(targetChatId) : {};
+  const rawChatState = store ? store.getChatState(targetChatId) : {};
+  let chatState = rawChatState;
+  if (store && String(targetChatId).toLowerCase().endsWith('@lid') && event.phone) {
+    const phoneChatId = toWhatsAppId(event.phone);
+    if (phoneChatId && typeof store.getChatState === 'function') {
+      chatState = mergeChatStates(rawChatState, store.getChatState(phoneChatId));
+    }
+  }
   if (store && typeof store.updateChatState === 'function') {
-    const prevCount = Number(chatState.customerMessageCount) || 0;
+    const prevCount = Number(rawChatState.customerMessageCount) || 0;
     store.updateChatState(targetChatId, {
-      firstSeenAt: chatState.firstSeenAt ?? nowMs,
+      firstSeenAt: rawChatState.firstSeenAt ?? nowMs,
       lastCustomerMessageAt: nowMs,
       customerMessageCount: prevCount + 1,
     });

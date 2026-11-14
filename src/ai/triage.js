@@ -66,8 +66,11 @@ const CRITICAL_PATTERNS = [
   /\bhacklendi\b/,
   /\bodeme\s+(gecemiyor|calismiyor|alinamiyor)\b/,
   /\bkasa\s+kilitlendi\b/,
-  /\byangin\b/,
+  /\byangin\s+(cikti|var|alarmi|tehlikesi)\b/,
 ];
+
+const CUSTOMER_PROBLEM_RE =
+  /\b(verilmedi|gelmedi|gelmiyor|calismiyor|hatasi|sorun|nerede|ne zaman|hangi)\b/;
 
 const URGENT_PATTERNS = [
   /\bacil\b/,
@@ -77,10 +80,22 @@ const URGENT_PATTERNS = [
 ];
 
 function isPureEmojiOrPunctuation(text) {
-  const withoutEmojiAndPunct = String(text || '')
+  const str = String(text || '');
+  if (/[\p{L}\p{N}?]/u.test(str)) {
+    return false;
+  }
+  const withoutEmojiAndPunct = str
     .replace(/[\p{Extended_Pictographic}\p{Emoji_Component}\u200D\uFE0F]/gu, '')
     .replace(/[\s.,!?…\-_~`"':;()[\]{}/\\+*]+/g, '');
   return withoutEmojiAndPunct.length === 0;
+}
+
+function sanitizeTriageField(text) {
+  return String(text ?? '')
+    .replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ')
+    .replace(/<\/?MUSTERI_MESAJI>/gi, '[MUSTERI_MESAJI]')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function isTrivialClosing(normalizedText) {
@@ -131,15 +146,13 @@ export function classifyRuleBasedMessage(event = {}, summaryTextOverride = '') {
     return { priority: 'ignore', reason: 'trivial_media', summary: summaryText };
   }
 
-  if (rawBody && isPureEmojiOrPunctuation(rawBody) && (type === 'chat' || type === 'text' || !event?.hasMedia)) {
+  const isPlainTextType = type === 'chat' || type === 'text';
+
+  if (isPlainTextType && rawBody && isPureEmojiOrPunctuation(rawBody)) {
     return { priority: 'ignore', reason: 'emoji_only', summary: summaryText };
   }
 
   const normalized = normalizeTurkishText(rawBody || summaryText);
-
-  if (AUTOMATED_PATTERNS.some((re) => re.test(normalized))) {
-    return { priority: 'ignore', reason: 'automated_or_otp', summary: summaryText };
-  }
 
   if (CRITICAL_PATTERNS.some((re) => re.test(normalized))) {
     return { priority: 'critical', reason: 'critical_outage_keyword', summary: summaryText };
@@ -149,11 +162,19 @@ export function classifyRuleBasedMessage(event = {}, summaryTextOverride = '') {
     return { priority: 'urgent', reason: 'voice_message', summary: summaryText };
   }
 
+  if (
+    !normalized.includes('?') &&
+    !CUSTOMER_PROBLEM_RE.test(normalized) &&
+    AUTOMATED_PATTERNS.some((re) => re.test(normalized))
+  ) {
+    return { priority: 'ignore', reason: 'automated_or_otp', summary: summaryText };
+  }
+
   if (URGENT_PATTERNS.some((re) => re.test(normalized))) {
     return { priority: 'urgent', reason: 'urgent_keyword', summary: summaryText };
   }
 
-  if (isTrivialClosing(normalized)) {
+  if (isPlainTextType && isTrivialClosing(normalized)) {
     return { priority: 'ignore', reason: 'trivial_closing', summary: summaryText };
   }
 
@@ -235,14 +256,20 @@ export async function triageCustomerMessage(
   const historyLines = Array.isArray(recentMessages)
     ? recentMessages
         .slice(-4)
-        .map((m) => (typeof m === 'string' ? m : `${m?.fromMe ? 'Biz' : 'Müşteri'}: ${m?.body || ''}`))
+        .map((m) =>
+          sanitizeTriageField(
+            typeof m === 'string' ? m : `${m?.fromMe ? 'Biz' : 'Müşteri'}: ${m?.body || ''}`
+          )
+        )
         .filter(Boolean)
     : [];
+
+  const safeSummary = sanitizeTriageField(effectiveSummary || String(event?.body || ''));
 
   const userPrompt = [
     '<MUSTERI_MESAJI>',
     ...(historyLines.length > 0 ? [`Son bağlam: ${historyLines.join(' | ')}`] : []),
-    `Yeni mesaj: ${effectiveSummary || String(event?.body || '')}`,
+    `Yeni mesaj: ${safeSummary}`,
     '</MUSTERI_MESAJI>',
   ].join('\n');
 

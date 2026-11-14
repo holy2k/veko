@@ -14,7 +14,7 @@ import {
 } from './trigger/settings.js';
 
 let PACKAGE_META = {
-  version: '0.2.0',
+  version: '0.2.2',
   repositoryUrl: DEFAULT_GITHUB_REPO_URL,
 };
 try {
@@ -30,11 +30,21 @@ try {
     .replace(/\/+$/, '')
     .trim();
   PACKAGE_META = {
-    version: String(parsedPkg?.version || '0.2.0').trim() || '0.2.0',
+    version: String(parsedPkg?.version || '0.2.2').trim() || '0.2.2',
     repositoryUrl: cleanedRepo || DEFAULT_GITHUB_REPO_URL,
   };
 } catch {
   // Fallback safely if package.json cannot be read
+}
+
+function parseNumericEnv(raw, defaultValue, { allowZero = true } = {}) {
+  if (raw === undefined || raw === null) return defaultValue;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return defaultValue;
+  const num = Number(trimmed);
+  if (!Number.isFinite(num)) return defaultValue;
+  if (allowZero ? num < 0 : num <= 0) return defaultValue;
+  return num;
 }
 
 /**
@@ -115,6 +125,8 @@ export function loadConfig(env = process.env, deps = {}) {
     geminiLiveModel,
     geminiTextModel,
     ttsVoiceName: voiceCfg.voiceName || '',
+    aiVoice: voiceCfg,
+    aiText: textCfg,
     aiVoiceProvider: voiceCfg.provider,
     aiVoiceModel: voiceCfg.model,
     aiVoiceApiKey: voiceCfg.apiKey,
@@ -124,12 +136,14 @@ export function loadConfig(env = process.env, deps = {}) {
     aiTextModel: textCfg.model,
     aiTextApiKey: textCfg.apiKey,
     aiTextBaseUrl: textCfg.baseUrl,
-    cooldownMinutes: Number(env.COOLDOWN_MINUTES ?? 120),
-    missedRetryMinutes: Number(env.MISSED_RETRY_MINUTES ?? 30),
-    ownerActiveWindowMinutes: Number(env.OWNER_ACTIVE_WINDOW_MINUTES ?? 15),
-    callRingTimeoutSec: Number(env.CALL_RING_TIMEOUT_SEC ?? 35),
-    callMaxDurationSec: Number(env.CALL_MAX_DURATION_SEC ?? 300),
-    thirdPartyOutreachHours: Number(env.THIRD_PARTY_OUTREACH_HOURS ?? 24),
+    aiTextExtraHeaders: textCfg.extraHeaders || {},
+    cooldownMinutes: parseNumericEnv(env.COOLDOWN_MINUTES, 120, { allowZero: true }),
+    missedRetryMinutes: parseNumericEnv(env.MISSED_RETRY_MINUTES, 30, { allowZero: true }),
+    ownerActiveWindowMinutes: parseNumericEnv(env.OWNER_ACTIVE_WINDOW_MINUTES, 15, { allowZero: true }),
+    callRingTimeoutSec: parseNumericEnv(env.CALL_RING_TIMEOUT_SEC, 35, { allowZero: false }),
+    callMaxDurationSec: parseNumericEnv(env.CALL_MAX_DURATION_SEC, 300, { allowZero: false }),
+    thirdPartyOutreachHours: parseNumericEnv(env.THIRD_PARTY_OUTREACH_HOURS, 24, { allowZero: true }),
+    callAnswerConnectTimeoutSec: parseNumericEnv(env.CALL_ANSWER_CONNECT_TIMEOUT_SEC, 30, { allowZero: false }),
     callPolicy,
     callDelayMinutes,
     quietHoursEnabled,
@@ -142,7 +156,7 @@ export function loadConfig(env = process.env, deps = {}) {
     stateFilePath: env.STATE_FILE_PATH || './data/state.json',
     assistantName: env.ASSISTANT_NAME?.trim() || 'Veko',
     assistantStyle: String(env.ASSISTANT_STYLE || '').trim(),
-    appVersion: String(deps.appVersion || PACKAGE_META.version).trim() || '0.2.0',
+    appVersion: String(deps.appVersion || PACKAGE_META.version).trim() || '0.2.2',
     githubRepoUrl:
       String(env.GITHUB_REPO_URL || '').trim().replace(/\/+$/, '') || PACKAGE_META.repositoryUrl,
     updateCheckUrl: String(env.UPDATE_CHECK_URL || '').trim() || DEFAULT_UPDATE_CHECK_URL,

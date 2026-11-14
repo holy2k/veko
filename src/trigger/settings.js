@@ -85,6 +85,9 @@ export function computeIstanbulTimeTargetMs(hhMm, nowMs = Date.now()) {
   if (todayTarget >= nowMs) {
     return todayTarget;
   }
+  if (nowMs - todayTarget < 60_000) {
+    return nowMs + 60_000;
+  }
   return istanbulMidnightUtc(year, month, day + 1) + parsed.totalMinutes * 60_000;
 }
 
@@ -277,11 +280,17 @@ export function evaluateQuietStatus(settings, scheduleState = {}, nowMs = Date.n
     Number.isFinite(scheduleState.snoozedUntilMs) &&
     nowMs < scheduleState.snoozedUntilMs;
 
+  const hasStaleMorningPromptYmd =
+    typeof scheduleState?.lastMorningPromptYmd === 'string' &&
+    scheduleState.lastMorningPromptYmd.trim() !== '' &&
+    scheduleState.lastMorningPromptYmd.trim() !== todayYmd;
+
   const awaitingOwnerConfirm = Boolean(
     settings?.quietHoursEnabled &&
       settings?.quietHoursResumeMode === 'ask' &&
       !scheduledQuiet &&
       scheduleState?.awaitingOwnerConfirm === true &&
+      !hasStaleMorningPromptYmd &&
       scheduleState?.resumeConfirmedYmd !== todayYmd
   );
 

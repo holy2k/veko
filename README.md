@@ -6,7 +6,7 @@
 [![Voice AI](https://img.shields.io/badge/Voice%20AI-Gemini%20Live%20%7C%20OpenAI%20Realtime-4285F4)](#supported-ai-providers)
 [![Text AI](https://img.shields.io/badge/Text%20AI-Gemini%20%7C%20OpenAI%20%7C%20DeepSeek%20%7C%20Ollama%20%7C%20Claude-111827)](#supported-ai-providers)
 [![WhatsApp WebRTC](https://img.shields.io/badge/WhatsApp%20Web-WebRTC%20%2B%20AudioWorklet-25D366?logo=whatsapp&logoColor=white)](#architecture)
-[![Release](https://img.shields.io/badge/Release-v0.2.1-0ea5e9)](https://github.com/holy2k/veko/releases)
+[![Release](https://img.shields.io/badge/Release-v0.2.2-0ea5e9)](https://github.com/holy2k/veko/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Language Optimization Notice:** Veko is currently optimized for **Turkish** (system prompts, WhatsApp commands, and `Europe/Istanbul` calendar analytics). Support and optimizations for English and additional languages will be added and shared progressively.
@@ -58,7 +58,7 @@ flowchart LR
 * **Stealth Read (No Blue Ticks):** Never calls `sendSeen()` when inspecting customer messages or scanning chats.
 * **Voice Verbal Confirmation Gate:** Outbound WhatsApp messages require explicit verbal confirmation (`ownerConfirmed: true`) during voice calls and send an audit receipt to the owner.
 * **Code-Enforced 2-Step Text Draft Lock:** In text chat mode, `send_whatsapp_message` cannot send in a single turn. It first stages a 15-minute draft (`pendingOutgoingDraft`), shows the exact recipient and message text to the owner, and only sends when the next owner message confirms the exact recipient and text.
-* **Verified `@lid` Identity Resolution:** Resolves WhatsApp `@lid` identifiers with reverse `OWNER_PHONE` verification so unknown or unresolved `@lid` calls are never auto-answered.
+* **Verified `@lid` Identity & Thread Unification:** Resolves WhatsApp `@lid` identifiers with reverse `OWNER_PHONE` verification, deduplicates split `@lid` / `@c.us` threads across analytics and scans, and never auto-answers unresolved callers.
 * **Non-Intrusive Update Notifications:** Sends a one-time setup message upon first installation, applies a 15-minute cooldown to restart notices, and never wakes the owner at night — delivering new release notices only right after an answered call or text chat turn (toggleable via natural language or *"Güncelleme bildirimi kapat"*).
 * **Channel Filtering:** Ignores groups (`@g.us`), status updates (`status@broadcast`), broadcast lists, and newsletters (`@newsletter`).
 
@@ -139,6 +139,7 @@ GEMINI_API_KEY=AIza...
 | `QUIET_HOURS_RESUME_MODE` | `auto` | Morning resume behavior: `auto` (consolidated digest) or `ask` (ask confirmation first) |
 | `QUIET_HOURS_ALLOW_URGENT` | `false` | Allow `critical` emergencies to ring during quiet hours when `true` |
 | `CALL_RING_TIMEOUT_SEC` | `35` | Ring timeout in seconds |
+| `CALL_ANSWER_CONNECT_TIMEOUT_SEC` | `30` | Connect timeout (seconds) when answering incoming owner calls |
 | `CALL_MAX_DURATION_SEC` | `300` | Maximum call duration in seconds |
 | `COOLDOWN_MINUTES` | `120` | Cooldown after an answered/rejected call or approved text reply (min) |
 | `MISSED_RETRY_MINUTES` | `30` | Single auto-retry delay after a missed call (min) |

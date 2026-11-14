@@ -113,7 +113,7 @@ export async function checkForUpdateIfStale({
   cacheTtlMs = UPDATE_CHECK_CACHE_TTL_MS,
   timeoutMs = UPDATE_FETCH_TIMEOUT_MS,
 } = {}) {
-  const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.0';
+  const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.2';
   const repoUrl = String(config?.githubRepoUrl || DEFAULT_GITHUB_REPO_URL).trim() || DEFAULT_GITHUB_REPO_URL;
   const updateUrl = String(config?.updateCheckUrl || DEFAULT_UPDATE_CHECK_URL).trim() || DEFAULT_UPDATE_CHECK_URL;
   const updateState = store?.getUpdateState?.() || {};

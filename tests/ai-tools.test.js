@@ -861,7 +861,7 @@ test('list_recent_chats excludes owner chat, supports unreadOnly, and formats la
       async searchContacts() { return []; },
       async sendMessage() { return { id: 'x' }; },
       async listRecentChats(limit) {
-        assert.equal(limit, 10);
+        assert.ok(limit === 15 || limit === 50);
         return [
           {
             chatId: '905321112233@c.us',
@@ -1578,3 +1578,298 @@ test('send_whatsapp_message clears pendingDelayedCalls and quietQueue in both te
   assert.equal(store.getPendingDelayedCall(cust2), null);
   assert.equal(store.getQuietQueue().some((q) => q.chatId === cust2), false);
 });
+
+test('audit fixes: resolveChatId validation, whitespace turnId, draft preservation on failed send, voice third-party detection, listRecentChats slicing, and update_call_settings queue flushing', async () => {
+  // 1. resolveChatId validation
+  assert.equal(resolveChatId('@lid'), '');
+  assert.equal(resolveChatId(':0@lid'), '');
+  assert.equal(resolveChatId('invalid@c.us'), '');
+  assert.equal(resolveChatId('user@example.com'), '');
+  assert.equal(resolveChatId('12345678901234:0@lid'), '12345678901234@lid');
+  assert.equal(resolveChatId('0212 345 67 89'), '902123456789@c.us');
+
+  const { store, whatsapp, config } = makeEnv();
+  const fakeNow = Date.parse('2026-11-14T10:00:00+03:00');
+
+  // 2. Whitespace turnId bypass prevention
+  const execWsTurn = createToolExecutor({
+    whatsapp,
+    store,
+    config,
+    mode: 'text',
+    turnId: '   ',
+    nowMs: () => fakeNow,
+  });
+  const wsStage = await execWsTurn('send_whatsapp_message', {
+    chatId: '905551110003@c.us',
+    messageText: 'Test mesajı',
+    ownerConfirmed: true,
+  });
+  assert.equal(wsStage.ok, false);
+  assert.match(wsStage.draft.proposedInTurnId, /^auto-turn-/);
+
+  const wsSameTurnConfirm = await execWsTurn('send_whatsapp_message', {
+    chatId: '905551110003@c.us',
+    messageText: 'Test mesajı',
+    ownerConfirmed: true,
+  });
+  assert.equal(wsSameTurnConfirm.ok, false);
+  assert.match(wsSameTurnConfirm.error, /Same-turn confirmation is blocked/i);
+
+  // Draft with empty proposedInTurnId is also blocked from immediate confirmation
+  store.setPendingOutgoingDraft({
+    chatId: '905551110003@c.us',
+    messageText: 'Test mesajı',
+    proposedAt: fakeNow,
+    proposedInTurnId: '',
+  });
+  const execNextTurn = createToolExecutor({
+    whatsapp,
+    store,
+    config,
+    mode: 'text',
+    turnId: 'turn-valid-2',
+    nowMs: () => fakeNow + 1000,
+  });
+  const emptyTurnDraftRes = await execNextTurn('send_whatsapp_message', {
+    chatId: '905551110003@c.us',
+    messageText: 'Test mesajı',
+    ownerConfirmed: true,
+  });
+  assert.equal(emptyTurnDraftRes.ok, false);
+  assert.equal(store.getPendingOutgoingDraft(fakeNow + 1000).proposedInTurnId, 'turn-valid-2');
+
+  // 3. Clear draft ONLY after whatsapp.sendMessage succeeds
+  let sendBehavior = 'throw';
+  const flakyWhatsapp = {
+    ...whatsapp,
+    async sendMessage(chatId, text) {
+      if (sendBehavior === 'throw') {
+        throw new Error('WhatsApp Web disconnected');
+      }
+      if (sendBehavior === 'false') {
+        return { sent: false };
+      }
+      return whatsapp.sendMessage(chatId, text);
+    },
+  };
+  const execConfirmFlaky = createToolExecutor({
+    whatsapp: flakyWhatsapp,
+    store,
+    config,
+    mode: 'text',
+    turnId: 'turn-valid-3',
+    nowMs: () => fakeNow + 2000,
+  });
+
+  const failedThrow = await execConfirmFlaky('send_whatsapp_message', {
+    chatId: '905551110003@c.us',
+    messageText: 'Test mesajı',
+    ownerConfirmed: true,
+  });
+  assert.equal(failedThrow.ok, false);
+  assert.ok(store.getPendingOutgoingDraft(fakeNow + 2000), 'Draft must remain intact when sendMessage throws');
+
+  sendBehavior = 'false';
+  const failedFalse = await execConfirmFlaky('send_whatsapp_message', {
+    chatId: '905551110003@c.us',
+    messageText: 'Test mesajı',
+    ownerConfirmed: true,
+  });
+  assert.equal(failedFalse.ok, false);
+  assert.ok(store.getPendingOutgoingDraft(fakeNow + 2000), 'Draft must remain intact when sendMessage returns sent:false');
+
+  sendBehavior = 'ok';
+  const succeededRetry = await execConfirmFlaky('send_whatsapp_message', {
+    chatId: '905551110003@c.us',
+    messageText: 'Test mesajı',
+    ownerConfirmed: true,
+  });
+  assert.equal(succeededRetry.ok, true);
+  assert.equal(store.getPendingOutgoingDraft(fakeNow + 2000), null);
+
+  // 4. Voice-mode effectiveIsThirdParty false-positive prevention & queue clearing
+  const activeCust = '905551110001@c.us';
+  const delayedCust = '905551110002@c.us';
+  const quietCust = '905551110003@c.us';
+  const historyCust = '905551110004@c.us';
+  const explicitFalseCust = '905551110005@c.us';
+  const supplierThirdParty = '905559990000@c.us';
+
+  store.upsertPendingDelayedCall({
+    chatId: delayedCust,
+    customerName: 'Delayed Customer',
+    dueAtMs: fakeNow + 60_000,
+    messages: ['Selam'],
+  });
+  store.enqueueQuietMessage({
+    chatId: quietCust,
+    customerName: 'Quiet Customer',
+    phone: '905551110003',
+    priority: 'normal',
+    summary: 'Gece sordu',
+    latestMessage: 'Fiyat?',
+    atMs: fakeNow - 60_000,
+  });
+  store.updateChatState(historyCust, { customerMessageCount: 2 });
+  store.setPendingCallChatId(delayedCust);
+
+  const execVoiceActive = createToolExecutor({
+    whatsapp,
+    store,
+    config,
+    activeCustomerChatId: activeCust,
+    mode: 'voice',
+    nowMs: () => fakeNow,
+  });
+
+  const resDelayed = await execVoiceActive('send_whatsapp_message', {
+    chatId: delayedCust,
+    messageText: 'Yoldayız',
+    ownerConfirmed: true,
+  });
+  assert.equal(resDelayed.ok, true);
+  assert.equal(resDelayed.isThirdParty, false);
+  assert.equal(store.getChatState(delayedCust).thirdPartyOutreachUntil, undefined);
+  assert.equal(store.getPendingDelayedCall(delayedCust), null);
+  assert.equal(store.getPendingCallChatId(), null);
+
+  const resQuiet = await execVoiceActive('send_whatsapp_message', {
+    chatId: quietCust,
+    messageText: 'Günaydın, fiyat 1000 TL',
+    ownerConfirmed: true,
+  });
+  assert.equal(resQuiet.ok, true);
+  assert.equal(resQuiet.isThirdParty, false);
+  assert.equal(store.getChatState(quietCust).thirdPartyOutreachUntil, undefined);
+  assert.equal(store.getQuietQueue().some((q) => q.chatId === quietCust), false);
+
+  const resHistory = await execVoiceActive('send_whatsapp_message', {
+    chatId: historyCust,
+    messageText: 'Siparişiniz hazır',
+    ownerConfirmed: true,
+  });
+  assert.equal(resHistory.ok, true);
+  assert.equal(resHistory.isThirdParty, false);
+  assert.equal(store.getChatState(historyCust).thirdPartyOutreachUntil, undefined);
+
+  const resExplicitFalse = await execVoiceActive('send_whatsapp_message', {
+    chatId: explicitFalseCust,
+    messageText: 'Buyurun efendim',
+    ownerConfirmed: true,
+    isThirdParty: false,
+  });
+  assert.equal(resExplicitFalse.ok, true);
+  assert.equal(resExplicitFalse.isThirdParty, false);
+  assert.equal(store.getChatState(explicitFalseCust).thirdPartyOutreachUntil, undefined);
+
+  const resSupplier = await execVoiceActive('send_whatsapp_message', {
+    chatId: supplierThirdParty,
+    messageText: 'Parça var mı?',
+    ownerConfirmed: true,
+  });
+  assert.equal(resSupplier.ok, true);
+  assert.equal(resSupplier.isThirdParty, true);
+  assert.ok(store.getChatState(supplierThirdParty).thirdPartyOutreachUntil > fakeNow);
+
+  // 5. handleListRecentChats premature slice & ch.id fallback
+  const requestedLimits = [];
+  const execRecent = createToolExecutor({
+    store,
+    config,
+    whatsapp: {
+      ...whatsapp,
+      async listRecentChats(reqLimit) {
+        requestedLimits.push(reqLimit);
+        return [
+          { id: config.ownerChatId, name: 'Owner', unreadCount: 5, timestamp: 5000 },
+          { id: '905551110011@c.us', name: 'Read 1', unreadCount: 0, timestamp: 4000 },
+          { id: '905551110012@c.us', name: 'Unread 1', unreadCount: 2, timestamp: 3000 },
+          { id: '905551110013@c.us', name: 'Unread 2', unreadCount: 1, timestamp: 2000 },
+          { id: '905551110014@c.us', name: 'Unread 3', unreadCount: 3, timestamp: 1000 },
+        ];
+      },
+    },
+  });
+
+  const recentUnread = await execRecent('list_recent_chats', { limit: 2, unreadOnly: true });
+  assert.equal(requestedLimits[0], 50);
+  assert.equal(recentUnread.count, 2);
+  assert.deepEqual(
+    recentUnread.chats.map((c) => c.chatId),
+    ['905551110012@c.us', '905551110013@c.us']
+  );
+
+  const recentAll = await execRecent('list_recent_chats', { limit: 2, unreadOnly: false });
+  assert.equal(requestedLimits[1], 7);
+  assert.equal(recentAll.count, 2);
+  assert.deepEqual(
+    recentAll.chats.map((c) => c.chatId),
+    ['905551110011@c.us', '905551110012@c.us']
+  );
+
+  // 6. handleUpdateCallSettings flushes trapped quietQueue on quietHoursEnabled:false, quietHoursResumeMode:'auto', or resetToEnvDefaults:true
+  const quietCfg = {
+    ...config,
+    quietHoursEnabled: false,
+    quietHoursStart: '22:00',
+    quietHoursEnd: '09:00',
+    quietHoursResumeMode: 'auto',
+  };
+  const execSettings = createToolExecutor({
+    whatsapp,
+    store,
+    config: quietCfg,
+    mode: 'text',
+    nowMs: () => fakeNow,
+  });
+
+  // Case A: quietHoursEnabled: false flushes queue
+  store.setCallSettingsOverrides({ quietHoursEnabled: true, quietHoursResumeMode: 'ask' });
+  store.setQuietScheduleState({ awaitingOwnerConfirm: true, wasQuietPendingResume: true, lastMorningPromptYmd: '2026-11-14' });
+  store.enqueueQuietMessage({
+    chatId: '905551110021@c.us',
+    customerName: 'Queue A',
+    summary: 'Mesaj A',
+    atMs: fakeNow - 10_000,
+  });
+  const disableQuietRes = await execSettings('update_call_settings', { quietHoursEnabled: false });
+  assert.equal(disableQuietRes.ok, true);
+  assert.equal(disableQuietRes.flushedQuietQueueCount, 1);
+  assert.equal(disableQuietRes.flushedQuietMessages[0].customerName, 'Queue A');
+  assert.equal(store.getQuietQueue().length, 0);
+  assert.equal(store.getQuietScheduleState().awaitingOwnerConfirm, false);
+
+  // Case B: quietHoursResumeMode: 'auto' when !scheduledQuiet && awaitingOwnerConfirm flushes queue
+  store.setCallSettingsOverrides({ quietHoursEnabled: true, quietHoursResumeMode: 'ask' });
+  store.setQuietScheduleState({ awaitingOwnerConfirm: true, wasQuietPendingResume: true, lastMorningPromptYmd: '2026-11-14' });
+  store.enqueueQuietMessage({
+    chatId: '905551110022@c.us',
+    customerName: 'Queue B',
+    summary: 'Mesaj B',
+    atMs: fakeNow - 10_000,
+  });
+  const switchAutoRes = await execSettings('update_call_settings', { quietHoursResumeMode: 'auto' });
+  assert.equal(switchAutoRes.ok, true);
+  assert.equal(switchAutoRes.flushedQuietQueueCount, 1);
+  assert.equal(switchAutoRes.flushedQuietMessages[0].customerName, 'Queue B');
+  assert.equal(store.getQuietQueue().length, 0);
+  assert.equal(store.getQuietScheduleState().awaitingOwnerConfirm, false);
+
+  // Case C: resetToEnvDefaults: true when resulting settings are not in isQuietNow flushes queue
+  store.setCallSettingsOverrides({ quietHoursEnabled: true, quietHoursResumeMode: 'ask' });
+  store.setQuietScheduleState({ awaitingOwnerConfirm: true, wasQuietPendingResume: true, lastMorningPromptYmd: '2026-11-14' });
+  store.enqueueQuietMessage({
+    chatId: '905551110023@c.us',
+    customerName: 'Queue C',
+    summary: 'Mesaj C',
+    atMs: fakeNow - 10_000,
+  });
+  const resetFlushRes = await execSettings('update_call_settings', { resetToEnvDefaults: true });
+  assert.equal(resetFlushRes.ok, true);
+  assert.equal(resetFlushRes.flushedQuietQueueCount, 1);
+  assert.equal(resetFlushRes.flushedQuietMessages[0].customerName, 'Queue C');
+  assert.equal(store.getQuietQueue().length, 0);
+  assert.equal(store.getQuietScheduleState().awaitingOwnerConfirm, false);
+});
+

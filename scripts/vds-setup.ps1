@@ -41,7 +41,8 @@ $browserPaths = @(
   "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
   "$env:LocalAppData\Google\Chrome\Application\chrome.exe",
   "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-  "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+  "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+  "$env:LocalAppData\Microsoft\Edge\Application\msedge.exe"
 )
 $foundBrowser = $browserPaths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 if ($foundBrowser) {
@@ -117,29 +118,33 @@ if ($isAdmin) {
 
 # 5. Istege bagli Task Scheduler gorevi (Interactive session, Chrome Headless=false uyumlu)
 if ($RegisterScheduledTask) {
-  $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-  $action = New-ScheduledTaskAction `
-    -Execute $nodeCmd.Source `
-    -Argument 'src/index.js' `
-    -WorkingDirectory $ProjectRoot
-  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
-  $settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -RestartCount 5 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -ExecutionTimeLimit (New-TimeSpan -Days 3650)
+  if (-not $isAdmin) {
+    Write-Warning 'Zamanlanmis gorev (-RegisterScheduledTask) kaydetmek icin PowerShelli Yonetici (Run as Administrator) olarak calistirmaniz gerekir. Lutfen Yonetici PowerShell acip komutu tekrar calistirin.'
+  } else {
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $action = New-ScheduledTaskAction `
+      -Execute $nodeCmd.Source `
+      -Argument 'src/index.js' `
+      -WorkingDirectory $ProjectRoot
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+    $settings = New-ScheduledTaskSettingsSet `
+      -AllowStartIfOnBatteries `
+      -DontStopIfGoingOnBatteries `
+      -RestartCount 5 `
+      -RestartInterval (New-TimeSpan -Minutes 1) `
+      -ExecutionTimeLimit (New-TimeSpan -Days 3650)
 
-  Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger $trigger `
-    -Settings $settings `
-    -User $currentUser `
-    -RunLevel Limited `
-    -Force | Out-Null
+    Register-ScheduledTask `
+      -TaskName $TaskName `
+      -Action $action `
+      -Trigger $trigger `
+      -Settings $settings `
+      -User $currentUser `
+      -RunLevel Limited `
+      -Force | Out-Null
 
-  Write-Host "[OK] Zamanlanmis gorev kaydedildi: $TaskName (Kullanici: $currentUser)" -ForegroundColor Green
+    Write-Host "[OK] Zamanlanmis gorev kaydedildi: $TaskName (Kullanici: $currentUser)" -ForegroundColor Green
+  }
 }
 
 Write-Host ''

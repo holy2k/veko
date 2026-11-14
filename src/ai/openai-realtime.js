@@ -6,6 +6,17 @@ import { base64ToInt16Safely, int16ToBase64, resamplePcm16 } from '../whatsapp/p
 const OPENAI_REALTIME_INPUT_RATE = 24000;
 const WHATSAPP_PCM_INPUT_RATE = 16000;
 const OPENAI_REALTIME_OUTPUT_MIME = 'audio/pcm;rate=24000';
+const GEMINI_ONLY_VOICES = new Set(['aoede', 'puck', 'charon', 'fenrir', 'kore']);
+
+function resolveOpenAIVoiceName(...candidates) {
+  for (const candidate of candidates) {
+    const trimmed = String(candidate || '').trim();
+    if (trimmed && !GEMINI_ONLY_VOICES.has(trimmed.toLowerCase())) {
+      return trimmed;
+    }
+  }
+  return 'cedar';
+}
 
 /**
  * Converts a Gemini `@google/genai` Schema object into standard JSON Schema
@@ -123,7 +134,7 @@ export async function startOpenAIRealtimeSession(
 
   const model = String(aiVoice.model || config.aiVoiceModel || config.openaiRealtimeModel || 'gpt-realtime-2.1').trim();
   const baseUrl = String(aiVoice.baseUrl || config.aiVoiceBaseUrl || 'wss://api.openai.com/v1/realtime').trim();
-  const voiceName = String(aiVoice.voiceName || config.aiVoiceName || config.ttsVoiceName || 'cedar').trim() || 'cedar';
+  const voiceName = resolveOpenAIVoiceName(aiVoice.voiceName, config.aiVoiceName, config.ttsVoiceName);
   const assistantName = String(config.assistantName || 'Veko').trim() || 'Veko';
   const assistantStyle = String(config.assistantStyle || '').trim();
   const isBetaPreview = /preview/i.test(model);
@@ -158,7 +169,9 @@ export async function startOpenAIRealtimeSession(
   let closeNotified = false;
   let activeResponseId = null;
   let responseHadToolCalls = false;
+  let endCallRequested = false;
   let inFlightToolPromises = [];
+  let toolExecutionChain = Promise.resolve();
   const handledCallIds = new Set();
 
   function safeCallback(fn, ...args) {
@@ -196,11 +209,15 @@ export async function startOpenAIRealtimeSession(
     const callId = String(call?.call_id || call?.id || '').trim();
     const name = String(call?.name || '').trim();
     if (!callId || !name || handledCallIds.has(callId)) {
-      return Promise.resolve();
+      return toolExecutionChain;
     }
     handledCallIds.add(callId);
+    if (name === 'end_call') {
+      endCallRequested = true;
+    }
 
-    const execPromise = (async () => {
+    const nextPromise = toolExecutionChain.then(async () => {
+      if (closed) return;
       let response;
       const parsed = parseToolArgs(call?.arguments);
       if (!parsed.ok) {
@@ -228,9 +245,10 @@ export async function startOpenAIRealtimeSession(
       } catch (err) {
         safeCallback(onError, err);
       }
-    })();
+    });
 
-    return execPromise;
+    toolExecutionChain = nextPromise.catch(() => {});
+    return toolExecutionChain;
   }
 
   function buildSessionUpdatePayload() {
@@ -282,18 +300,15 @@ export async function startOpenAIRealtimeSession(
   function closeSession() {
     if (closed) return;
     closed = true;
-    if (ws.readyState === 3 || typeof ws.close !== 'function') {
-      if (opened) {
-        emitCloseOnce({ code: 1000, reason: 'client_close' });
+    if (ws.readyState !== 3 && typeof ws.close === 'function') {
+      try {
+        ws.close();
+      } catch {
+        // Ignore ws.close errors during client teardown
       }
-      return;
     }
-    try {
-      ws.close();
-    } catch {
-      if (opened) {
-        emitCloseOnce({ code: 1000, reason: 'client_close' });
-      }
+    if (opened) {
+      emitCloseOnce({ code: 1000, reason: 'client_close' });
     }
   }
 
@@ -302,8 +317,11 @@ export async function startOpenAIRealtimeSession(
     const msg = safeParseJson(raw);
     if (!msg || typeof msg !== 'object') return;
 
-    const audioDeltaType = isBetaPreview ? 'response.audio.delta' : 'response.output_audio.delta';
-    if (msg.type === audioDeltaType && typeof msg.delta === 'string' && msg.delta) {
+    if (
+      (msg.type === 'response.output_audio.delta' || msg.type === 'response.audio.delta') &&
+      typeof msg.delta === 'string' &&
+      msg.delta
+    ) {
       safeCallback(onAudioChunk, msg.delta, OPENAI_REALTIME_OUTPUT_MIME);
       return;
     }
@@ -327,7 +345,7 @@ export async function startOpenAIRealtimeSession(
         inFlightToolPromises.push(p);
       } else {
         p.then(() => {
-          if (!closed) {
+          if (!closed && !activeResponseId && !endCallRequested) {
             try {
               sendJson({ type: 'response.create' });
             } catch (err) {
@@ -359,7 +377,7 @@ export async function startOpenAIRealtimeSession(
 
       if (shouldCreateNextResponse) {
         Promise.all(pending).then(() => {
-          if (!closed) {
+          if (!closed && !activeResponseId && !endCallRequested) {
             try {
               sendJson({ type: 'response.create' });
             } catch (err) {

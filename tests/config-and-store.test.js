@@ -265,7 +265,7 @@ test('review fixes: pendingOutgoingDraft and ownerChatHistory persist immediatel
 
 test('loadConfig reads appVersion, githubRepoUrl, and updateCheckUrl with overrides', () => {
   const def = loadConfig({ OWNER_PHONE: '05321112233', GEMINI_API_KEY: 'test-key' });
-  assert.equal(def.appVersion, '0.2.1');
+  assert.equal(def.appVersion, '0.2.2');
   assert.equal(def.githubRepoUrl, 'https://github.com/holy2k/veko');
   assert.equal(def.updateCheckUrl, 'https://raw.githubusercontent.com/holy2k/veko/main/package.json');
 
@@ -499,3 +499,157 @@ test('quiet hours evaluator handles Europe/Istanbul overnight, same-day, snooze,
   const target1030 = computeIstanbulTimeTargetMs('10:30', nineAmMs);
   assert.equal(target1030, Date.UTC(2026, 10, 14, 7, 30, 0));
 });
+
+test('audit fixes: normalizePhone @lid/00/landline, loadConfig safe numeric parsing & aiVoice/aiText, store quietQueue merge & EPERM flush, and settings Day-2 confirm & same-minute snooze', () => {
+  // 1. normalizePhone @lid rejection, 00 prefix stripping, and Turkish landline/850 normalization
+  assert.equal(normalizePhone('12345678901234@lid'), '');
+  assert.equal(normalizePhone('12345678901234:0@lid'), '');
+  assert.equal(normalizePhone('00905321112233'), '905321112233');
+  assert.equal(normalizePhone('0090 212 345 67 89'), '902123456789');
+  assert.equal(normalizePhone('0212 345 67 89'), '902123456789');
+  assert.equal(normalizePhone('2123456789'), '902123456789');
+  assert.equal(normalizePhone('03121112233'), '903121112233');
+  assert.equal(normalizePhone('04121112233'), '904121112233');
+  assert.equal(normalizePhone('08501112233'), '908501112233');
+  assert.equal(normalizePhone('8501112233'), '908501112233');
+
+  // 2. loadConfig exposes aiVoice, aiText, aiTextExtraHeaders, callAnswerConnectTimeoutSec, and safe numeric parsing
+  const cfgWithEmptyAndInvalid = loadConfig({
+    OWNER_PHONE: '00905321112233',
+    GEMINI_API_KEY: 'test-key',
+    COOLDOWN_MINUTES: '',
+    MISSED_RETRY_MINUTES: '   ',
+    OWNER_ACTIVE_WINDOW_MINUTES: 'abc',
+    CALL_RING_TIMEOUT_SEC: '0',
+    CALL_MAX_DURATION_SEC: '-10',
+    THIRD_PARTY_OUTREACH_HOURS: '-1',
+    CALL_ANSWER_CONNECT_TIMEOUT_SEC: '0',
+  });
+  assert.equal(cfgWithEmptyAndInvalid.ownerPhone, '905321112233');
+  assert.equal(cfgWithEmptyAndInvalid.aiVoice.provider, 'gemini');
+  assert.equal(cfgWithEmptyAndInvalid.aiText.provider, 'gemini');
+  assert.deepEqual(cfgWithEmptyAndInvalid.aiTextExtraHeaders, {});
+  assert.equal(cfgWithEmptyAndInvalid.cooldownMinutes, 120);
+  assert.equal(cfgWithEmptyAndInvalid.missedRetryMinutes, 30);
+  assert.equal(cfgWithEmptyAndInvalid.ownerActiveWindowMinutes, 15);
+  assert.equal(cfgWithEmptyAndInvalid.callRingTimeoutSec, 35);
+  assert.equal(cfgWithEmptyAndInvalid.callMaxDurationSec, 300);
+  assert.equal(cfgWithEmptyAndInvalid.thirdPartyOutreachHours, 24);
+  assert.equal(cfgWithEmptyAndInvalid.callAnswerConnectTimeoutSec, 30);
+  assert.equal(cfgWithEmptyAndInvalid.appVersion, '0.2.2');
+
+  const cfgZeroAllowed = loadConfig({
+    OWNER_PHONE: '05321112233',
+    GEMINI_API_KEY: 'test-key',
+    COOLDOWN_MINUTES: '0',
+    MISSED_RETRY_MINUTES: '0',
+    OWNER_ACTIVE_WINDOW_MINUTES: '0',
+    THIRD_PARTY_OUTREACH_HOURS: '0',
+    CALL_ANSWER_CONNECT_TIMEOUT_SEC: '45',
+  });
+  assert.equal(cfgZeroAllowed.cooldownMinutes, 0);
+  assert.equal(cfgZeroAllowed.missedRetryMinutes, 0);
+  assert.equal(cfgZeroAllowed.ownerActiveWindowMinutes, 0);
+  assert.equal(cfgZeroAllowed.thirdPartyOutreachHours, 0);
+  assert.equal(cfgZeroAllowed.callAnswerConnectTimeoutSec, 45);
+
+  // 3. store.enqueueQuietMessage matches by phone/JID and joins distinct summaries without overwriting
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wpj-store-audit-'));
+  const file = path.join(tmpDir, 'state.json');
+  try {
+    const store = createStateStore(file);
+    store.enqueueQuietMessage({
+      chatId: '05551110002@c.us',
+      customerName: 'Ayşe',
+      phone: '05551110002',
+      priority: 'normal',
+      summary: '(1 mesaj) Fiyat sordu',
+      latestMessage: 'Fiyat nedir?',
+      atMs: 1_000,
+    });
+    store.enqueueQuietMessage({
+      chatId: '905551110002@c.us',
+      customerName: 'Ayşe Yılmaz',
+      phone: '905551110002',
+      priority: 'urgent',
+      summary: '(2 mesaj) Stok durumu sordu',
+      latestMessage: 'Stokta var mı?',
+      atMs: 2_000,
+    });
+    const queue = store.getQuietQueue();
+    assert.equal(queue.length, 1);
+    assert.equal(queue[0].messageCount, 2);
+    assert.equal(queue[0].summary, 'Fiyat sordu | Stok durumu sordu');
+
+    // Duplicate summary text is not repeated
+    store.enqueueQuietMessage({
+      chatId: '905551110002@c.us',
+      customerName: 'Ayşe Yılmaz',
+      phone: '905551110002',
+      priority: 'urgent',
+      summary: 'Stok durumu sordu',
+      latestMessage: 'Stokta var mı?',
+      atMs: 3_000,
+    });
+    assert.equal(store.getQuietQueue()[0].summary, 'Fiyat sordu | Stok durumu sordu');
+
+    // 4. store.flush() EPERM/EBUSY fallback and tmpPath cleanup
+    const origRename = fs.renameSync;
+    let renameCalls = 0;
+    fs.renameSync = () => {
+      renameCalls += 1;
+      const err = new Error('EPERM: operation not permitted, rename');
+      err.code = 'EPERM';
+      throw err;
+    };
+    try {
+      store.updateChatState('905559998877@c.us', { customerMessageCount: 5 });
+    } finally {
+      fs.renameSync = origRename;
+    }
+    assert.equal(renameCalls, 1);
+    const reloaded = createStateStore(file);
+    assert.equal(reloaded.getChatState('905559998877@c.us').customerMessageCount, 5);
+    const leftoverTmpFiles = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.tmp'));
+    assert.deepEqual(leftoverTmpFiles, []);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 5. evaluateQuietStatus scopes awaitingOwnerConfirm to todayYmd and computeIstanbulTimeTargetMs handles same-minute snooze
+  const askSettings = {
+    quietHoursEnabled: true,
+    quietHoursStart: '22:00',
+    quietHoursEnd: '09:00',
+    quietHoursResumeMode: 'ask',
+  };
+  // Day 1: 2026-11-13 09:05 Istanbul
+  const day1MorningMs = Date.parse('2026-11-13T09:05:00+03:00');
+  const day1Status = evaluateQuietStatus(
+    askSettings,
+    { awaitingOwnerConfirm: true, lastMorningPromptYmd: '2026-11-13', wasQuietPendingResume: true },
+    day1MorningMs,
+    1
+  );
+  assert.equal(day1Status.awaitingOwnerConfirm, true);
+  assert.equal(day1Status.isQuietNow, true);
+  assert.equal(day1Status.shouldSendMorningPrompt, false);
+
+  // Day 2: 2026-11-14 09:05 Istanbul (owner ignored Day 1 prompt)
+  const day2MorningMs = Date.parse('2026-11-14T09:05:00+03:00');
+  const day2Status = evaluateQuietStatus(
+    askSettings,
+    { awaitingOwnerConfirm: true, lastMorningPromptYmd: '2026-11-13', wasQuietPendingResume: true },
+    day2MorningMs,
+    1
+  );
+  assert.equal(day2Status.awaitingOwnerConfirm, false);
+  assert.equal(day2Status.isQuietNow, false);
+  assert.equal(day2Status.shouldSendMorningPrompt, true);
+
+  // Same-minute target in computeIstanbulTimeTargetMs returns nowMs + 60_000 instead of +24h
+  const now1030And25Sec = Date.parse('2026-11-14T10:30:25+03:00');
+  const sameMinTarget = computeIstanbulTimeTargetMs('10:30', now1030And25Sec);
+  assert.equal(sameMinTarget, now1030And25Sec + 60_000);
+});
+

@@ -6,7 +6,7 @@
 [![Voice AI](https://img.shields.io/badge/Voice%20AI-Gemini%20Live%20%7C%20OpenAI%20Realtime-4285F4)](#desteklenen-yapay-zekâ-sağlayıcıları)
 [![Text AI](https://img.shields.io/badge/Text%20AI-Gemini%20%7C%20OpenAI%20%7C%20DeepSeek%20%7C%20Ollama%20%7C%20Claude-111827)](#desteklenen-yapay-zekâ-sağlayıcıları)
 [![WhatsApp WebRTC](https://img.shields.io/badge/WhatsApp%20Web-WebRTC%20%2B%20AudioWorklet-25D366?logo=whatsapp&logoColor=white)](#mimari)
-[![Sürüm](https://img.shields.io/badge/Sürüm-v0.2.1-0ea5e9)](https://github.com/holy2k/veko/releases)
+[![Sürüm](https://img.shields.io/badge/Sürüm-v0.2.2-0ea5e9)](https://github.com/holy2k/veko/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Dil Notu:** Veko şu anda **yalnızca Türkçe** için optimize edilmiştir (sistem istemleri, WhatsApp komutları ve `Europe/Istanbul` saat dilimi analizleri). Diğer diller için optimize edildikçe güncellenip paylaşılacaktır.
@@ -58,7 +58,7 @@ flowchart LR
 * **"Mavi Tik" Göndermeden Okuma (Stealth Read):** Ne normal dinlemede ne de müşteri istatistik taramasında `sendSeen()` çağrılmaz.
 * **Sesli Görüşmede Sözlü Onay Kilidi:** Canlı aramada yapay zekâ, alıcıyı ve mesaj metnini sesli okuyup açık sözlü onay (`ownerConfirmed: true`) almadan `send_whatsapp_message` aracını çalıştıramaz; her gönderim sonrası işletme sahibine denetim mesajı düşer.
 * **Kod Seviyesinde 2 Adımlı Yazılı Onay Kilidi:** Yazılı sohbette model ilk turda asla dış mesaj gönderemez. Önce 15 dakikalık geçici taslağı (`pendingOutgoingDraft`) diske kilitler, alıcıyı ve tam mesaj metnini gösterir; yalnızca bir sonraki mesajınızda alıcı + metin eşleşen açık yazılı onay geldiğinde gönderim yapar.
-* **Sağlam `@lid` Kimlik Doğrulama:** WhatsApp `@lid` kimliklerini ters `OWNER_PHONE` eşleştirmesiyle doğrular; çözümlenemeyen yabancı `@lid` aramaları açılmaz.
+* **Sağlam `@lid` Kimlik Doğrulama & Sohbet Birleştirme:** WhatsApp `@lid` kimliklerini ters `OWNER_PHONE` eşleştirmesiyle doğrular, analiz ve taramalarda aynı kişiye ait `@lid` / `@c.us` sohbetlerini tekilleştirir ve çözümlenemeyen yabancı `@lid` aramalarını açmaz.
 * **Rahatsız Etmeyen Güncelleme Bildirimleri:** İlk kurulumda tek seferlik bilgilendirme mesajı atar, yeniden başlatmalarda **15 dakikalık spam koruması** uygular ve 7/24 çalışmada gece yarısı asla mesaj atmaz — yeni sürüm bildirimini yalnızca cevaplanan bir sesli görüşme veya yazılı sohbet tamamlandığında iletir (*"Güncelleme bildirimi kapat"* diyerek veya doğal dille kapatılabilir).
 * **Grup ve Kanal Koruması:** Grup (`@g.us`), durum (`status@broadcast`), yayın listesi ve bülten (`@newsletter`) sohbetleri yoksayılır.
 
@@ -139,6 +139,7 @@ GEMINI_API_KEY=AIza...
 | `QUIET_HOURS_RESUME_MODE` | `auto` | Sabah dönüş modu: `auto` (toplu özet gönder) veya `ask` (önce onay sor) |
 | `QUIET_HOURS_ALLOW_URGENT` | `false` | `true` iken sessiz saatlerde yalnızca `critical` acil durumlarda arama yapar |
 | `CALL_RING_TIMEOUT_SEC` | `35` | Çalma zaman aşımı (saniye) |
+| `CALL_ANSWER_CONNECT_TIMEOUT_SEC` | `30` | Gelen patron aramasını yanıtlarken WebRTC bağlantı zaman aşımı (saniye) |
 | `CALL_MAX_DURATION_SEC` | `300` | Maksimum arama süresi (saniye) |
 | `COOLDOWN_MINUTES` | `120` | Cevaplanan arama veya onaylı yazılı yanıt sonrası bekleme süresi (dk) |
 | `MISSED_RETRY_MINUTES` | `30` | Cevapsız çağrıdan sonra tek otomatik yeniden deneme bekleme süresi (dk) |

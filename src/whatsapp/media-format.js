@@ -67,11 +67,18 @@ export function formatMessageBody(msg) {
 
   const label = buildMediaLabel(type, msg);
   if (!label) {
-    return trimmedBody;
+    return isLikelyBase64Blob(trimmedBody) ? '' : trimmedBody;
   }
 
-  const safeCaption =
-    type === 'location' && isLikelyBase64Blob(trimmedBody) ? '' : trimmedBody;
+  const rawFallbackCaption = msg.caption ?? msg.description ?? msg._data?.caption ?? '';
+  const trimmedFallbackCaption =
+    typeof rawFallbackCaption === 'string'
+      ? rawFallbackCaption.trim()
+      : String(rawFallbackCaption).trim();
+
+  const candidateCaption =
+    trimmedBody && !isLikelyBase64Blob(trimmedBody) ? trimmedBody : trimmedFallbackCaption;
+  const safeCaption = isLikelyBase64Blob(candidateCaption) ? '' : candidateCaption;
 
   return safeCaption ? `${label} ${safeCaption}` : label;
 }

@@ -30,4 +30,42 @@ test('formatMessageBody handles additional media types, missing metadata, and wh
     formatMessageBody({ type: 'location', body: '/9j/4AAQSkZJRgABAQAAAQABAAD/' + 'A'.repeat(120) }),
     '[Konum]'
   );
+  assert.equal(
+    formatMessageBody({
+      type: 'location',
+      body: '/9j/4AAQSkZJRgABAQAAAQABAAD/' + 'A'.repeat(120),
+      caption: 'Merkez Ofis Konumu',
+    }),
+    '[Konum] Merkez Ofis Konumu'
+  );
+  assert.equal(
+    formatMessageBody({
+      type: 'location',
+      body: '/9j/4AAQSkZJRgABAQAAAQABAAD/' + 'A'.repeat(120),
+      description: ' Kadıköy Şube ',
+    }),
+    '[Konum] Kadıköy Şube'
+  );
+  assert.equal(
+    formatMessageBody({
+      type: 'image',
+      body: '/9j/4AAQSkZJRgABAQAAAQABAAD/' + 'A'.repeat(120),
+      _data: { caption: 'Fatura görseli' },
+    }),
+    '[Fotoğraf] Fatura görseli'
+  );
+  assert.equal(
+    formatMessageBody({
+      type: 'image',
+      body: '/9j/4AAQSkZJRgABAQAAAQABAAD/' + 'A'.repeat(120),
+    }),
+    '[Fotoğraf]'
+  );
+  assert.equal(
+    formatMessageBody({
+      type: 'video',
+      body: '/9j/4AAQSkZJRgABAQAAAQABAAD/' + 'A'.repeat(120),
+    }),
+    '[Video]'
+  );
 });

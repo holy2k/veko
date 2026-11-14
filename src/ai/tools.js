@@ -281,10 +281,14 @@ export function resolveChatId(chatIdOrPhone) {
   if (raw.includes('@')) {
     const clean = stripJidDeviceTag(raw);
     const lower = clean.toLowerCase();
-    if (lower.endsWith('@lid') || isUnsupportedChatId(lower)) {
+    if (lower.endsWith('@lid')) {
+      const userPart = clean.slice(0, -4).trim();
+      return userPart ? clean : '';
+    }
+    if (isUnsupportedChatId(lower)) {
       return clean;
     }
-    return toWhatsAppId(clean) || clean;
+    return toWhatsAppId(clean);
   }
 
   return toWhatsAppId(raw);
@@ -313,12 +317,13 @@ export function isSameChatIdentity(a, b) {
 }
 
 function normalizeContactMatch(entry) {
-  const chatId = resolveChatId(entry?.chatId || entry?.phone || '');
+  const chatId = resolveChatId(entry?.chatId || entry?.id || entry?.phone || '');
   const lid = isLidJid(chatId);
   const rawPhone = normalizePhone(entry?.phone || '');
-  const lidDigits = lid ? normalizePhone(chatId) : '';
+  const lidUserDigits = lid ? chatId.split('@')[0].replace(/\D/g, '') : '';
+  const lidNormalizedDigits = lid ? normalizePhone(lidUserDigits) : '';
   const phone = lid
-    ? (rawPhone && rawPhone !== lidDigits ? rawPhone : '')
+    ? (rawPhone && rawPhone !== lidUserDigits && rawPhone !== lidNormalizedDigits ? rawPhone : '')
     : (rawPhone || normalizePhone(chatId));
 
   return {
@@ -352,7 +357,7 @@ export function createToolExecutor({
   onDelayCleared,
 } = {}) {
   const isTextMode = mode === 'text';
-  const effectiveTurnId = String(turnId || `auto-turn-${++autoTurnCounter}`).trim();
+  const effectiveTurnId = String(turnId || '').trim() || `auto-turn-${++autoTurnCounter}`;
   const getNowMs =
     typeof nowMs === 'function'
       ? nowMs
@@ -409,6 +414,8 @@ export function createToolExecutor({
       nextSnoozeMs = now + Math.round(mins * 60_000);
     }
 
+    const snapBefore = buildSettingsSnapshot(now);
+
     if (args.resetToEnvDefaults === true) {
       store?.resetCallSettingsOverrides?.();
     }
@@ -439,7 +446,6 @@ export function createToolExecutor({
     let confirmedMorningResume = false;
     let flushedQuietMessages = [];
     if (args.confirmMorningResume === true) {
-      const snapBefore = buildSettingsSnapshot(now);
       const todayYmd = snapBefore.quietStatus.todayYmd;
       flushedQuietMessages = store?.clearQuietQueue?.() || [];
       store?.setQuietScheduleState?.({
@@ -451,6 +457,30 @@ export function createToolExecutor({
         lastMorningPromptYmd: todayYmd,
       });
       confirmedMorningResume = true;
+    } else {
+      const snapAfter = buildSettingsSnapshot(now);
+      const disabledQuietHours = patchCheck.patch.quietHoursEnabled === false;
+      const switchedToAutoWhileAwaiting =
+        patchCheck.patch.quietHoursResumeMode === 'auto' &&
+        !snapBefore.quietStatus.scheduledQuiet &&
+        snapBefore.quietStatus.awaitingOwnerConfirm;
+      const resetReleasedQuiet =
+        args.resetToEnvDefaults === true &&
+        !snapAfter.quietStatus.scheduledQuiet &&
+        !snapAfter.quietStatus.snoozeActive &&
+        resolveCallSettings(config, store).quietHoursResumeMode !== 'ask' ||
+        (args.resetToEnvDefaults === true && !snapAfter.quietStatus.isQuietNow);
+
+      if (disabledQuietHours || switchedToAutoWhileAwaiting || resetReleasedQuiet) {
+        store?.setQuietScheduleState?.({
+          awaitingOwnerConfirm: false,
+          wasQuietPendingResume: false,
+        });
+        const postReleaseSnap = buildSettingsSnapshot(now);
+        if (!postReleaseSnap.quietStatus.isQuietNow) {
+          flushedQuietMessages = store?.clearQuietQueue?.() || [];
+        }
+      }
     }
 
     return {
@@ -495,13 +525,13 @@ export function createToolExecutor({
 
     const rawLimit = Number(args.limit);
     const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 30) : 10;
-    const rawChats = await whatsapp.listRecentChats(limit);
-    const ownerChatId = config?.ownerChatId ? resolveChatId(config.ownerChatId) : '';
     const unreadOnly = args.unreadOnly === true;
+    const rawChats = await whatsapp.listRecentChats(unreadOnly ? 50 : Math.min(limit + 5, 50));
+    const ownerChatId = config?.ownerChatId ? resolveChatId(config.ownerChatId) : '';
 
     const chats = [];
     for (const ch of rawChats || []) {
-      const chatId = resolveChatId(ch?.chatId || ch?.phone || '');
+      const chatId = resolveChatId(ch?.chatId || ch?.id || ch?.phone || '');
       if (!chatId || isUnsupportedChatId(chatId)) continue;
       if (ownerChatId && isSameChatIdentity(chatId, ownerChatId)) continue;
       const unreadCount = Number(ch?.unreadCount || 0) || 0;
@@ -518,10 +548,11 @@ export function createToolExecutor({
       });
     }
 
+    const limitedChats = chats.slice(0, limit);
     return {
       ok: true,
-      count: chats.length,
-      chats,
+      count: limitedChats.length,
+      chats: limitedChats,
     };
   }
 
@@ -562,6 +593,7 @@ export function createToolExecutor({
       return { ok: false, error: 'Valid target chatId is required.' };
     }
 
+    const now = getNowMs();
     const effectiveCustomerChatId = isTextMode
       ? activeCustomerChatId
       : activeCustomerChatId || store?.getPendingCallChatId?.() || '';
@@ -570,12 +602,31 @@ export function createToolExecutor({
     const isCustomerTarget = Boolean(
       effectiveCustomerChatId && isSameChatIdentity(targetChatId, effectiveCustomerChatId)
     );
+    const delayedMapBefore = store?.getPendingDelayedCalls?.() || {};
+    const hasPendingDelayed = Object.keys(delayedMapBefore).some(
+      (key) => key === targetChatId || isSameChatIdentity(key, targetChatId)
+    );
+    const quietItemsBefore = store?.getQuietQueue?.() || [];
+    const hasQuietQueued = quietItemsBefore.some(
+      (item) =>
+        item?.chatId &&
+        (item.chatId === targetChatId || isSameChatIdentity(item.chatId, targetChatId))
+    );
+    const targetState = store?.getChatState?.(targetChatId) || {};
+    const hasActiveThirdPartyOutreach =
+      typeof targetState.thirdPartyOutreachUntil === 'number' &&
+      targetState.thirdPartyOutreachUntil > now;
+    const hasExistingCustomerActivity =
+      Number(targetState.customerMessageCount) > 0 && !hasActiveThirdPartyOutreach;
+    const isKnownCustomerTarget =
+      isCustomerTarget || hasPendingDelayed || hasQuietQueued || hasExistingCustomerActivity;
+
     let effectiveIsThirdParty =
       !isOwnerTarget &&
-      !isCustomerTarget &&
+      !isKnownCustomerTarget &&
+      args.isThirdParty !== false &&
       (args.isThirdParty === true || Boolean(effectiveCustomerChatId));
 
-    const now = getNowMs();
     const recipientName = String(args.recipientName || '').trim();
 
     if (isTextMode) {
@@ -606,7 +657,7 @@ export function createToolExecutor({
         );
       }
 
-      if (existingDraft.proposedInTurnId && existingDraft.proposedInTurnId === effectiveTurnId) {
+      if (!existingDraft.proposedInTurnId || existingDraft.proposedInTurnId === effectiveTurnId) {
         return stageDraft(
           'pending_confirmation',
           'Same-turn confirmation is blocked. Wait for the owner’s next reply confirming the draft before sending.'
@@ -623,7 +674,7 @@ export function createToolExecutor({
       }
 
       if (args?.isThirdParty !== false && existingDraft.isThirdParty) {
-        effectiveIsThirdParty = !isOwnerTarget && !isCustomerTarget;
+        effectiveIsThirdParty = !isOwnerTarget && !isKnownCustomerTarget;
       }
 
       if (args?.ownerConfirmed !== true) {
@@ -639,13 +690,23 @@ export function createToolExecutor({
             'Owner confirmation required: set ownerConfirmed to true only after the owner explicitly approves sending.',
         };
       }
-
-      store?.clearPendingOutgoingDraft?.();
     }
 
-    const targetRes = await whatsapp.sendMessage(targetChatId, messageText);
+    let targetRes;
+    try {
+      targetRes = await whatsapp.sendMessage(targetChatId, messageText);
+    } catch (err) {
+      return {
+        ok: false,
+        error: err?.message || 'Failed to send WhatsApp message.',
+      };
+    }
     if (!targetRes || (!targetRes.id && targetRes.sent === false)) {
       return { ok: false, error: 'Failed to send WhatsApp message.' };
+    }
+
+    if (isTextMode) {
+      store?.clearPendingOutgoingDraft?.();
     }
 
     if (targetRes.id) {
@@ -665,14 +726,11 @@ export function createToolExecutor({
       });
     }
 
-    if (isTextMode) {
+    if (!isOwnerTarget) {
       const pendingId = store?.getPendingCallChatId?.();
-      if (pendingId && isSameChatIdentity(pendingId, targetChatId)) {
-        store.setPendingCallChatId(null);
+      if (pendingId && (pendingId === targetChatId || isSameChatIdentity(pendingId, targetChatId))) {
+        store?.setPendingCallChatId?.(null);
       }
-    }
-
-    if (!isOwnerTarget && !effectiveIsThirdParty) {
       const delayedMap = store?.getPendingDelayedCalls?.() || {};
       for (const key of Object.keys(delayedMap)) {
         if (key === targetChatId || isSameChatIdentity(key, targetChatId)) {

@@ -124,8 +124,9 @@ async function verifyOrReinstateBridgeAfterNavigation(page, hookScript) {
   return ensurePageBridge(page);
 }
 
-async function openOwnerChat(page, ownerPhone, ownerChatId, chatOpenSettleMs) {
-  const openedViaCmd = await page
+async function openOwnerChat(page, ownerPhone, ownerChatId, chatOpenSettleMs, evalTimeoutMs = 5000) {
+  let evalTimer = null;
+  const evalPromise = page
     .evaluate(async (chatId) => {
       try {
         const chat = await window.WWebJS?.getChat?.(chatId, { getAsModel: false });
@@ -144,6 +145,14 @@ async function openOwnerChat(page, ownerPhone, ownerChatId, chatOpenSettleMs) {
       return false;
     }, ownerChatId)
     .catch(() => false);
+
+  const boundedTimeoutMs = Math.max(10, Number(evalTimeoutMs) || 5000);
+  const timeoutPromise = new Promise((resolve) => {
+    evalTimer = setTimeout(() => resolve(false), boundedTimeoutMs);
+  });
+
+  const openedViaCmd = await Promise.race([evalPromise, timeoutPromise]);
+  if (evalTimer) clearTimeout(evalTimer);
 
   if (openedViaCmd) {
     if (chatOpenSettleMs > 0) await sleep(chatOpenSettleMs);
@@ -316,8 +325,10 @@ export function createCallController({
           if (ended || gen !== flushGeneration) return 0;
           try {
             return await page.evaluate(
-              (payload) => window.__wpJarvisAudio?.pushOutgoingBase64Pcm?.(payload, 24000) ?? 0,
-              b64
+              (payload, expectedGen) =>
+                window.__wpJarvisAudio?.pushOutgoingBase64Pcm?.(payload, 24000, expectedGen) ?? 0,
+              b64,
+              gen
             );
           } catch {
             return 0;
@@ -328,15 +339,30 @@ export function createCallController({
       },
       async flushAudioToOwner() {
         flushGeneration += 1;
+        const targetGen = flushGeneration;
         if (ended || !page) return 0;
-        try {
-          return await page.evaluate(() => window.__wpJarvisAudio?.flushOutgoingPcm?.() ?? 0);
-        } catch {
-          return 0;
-        }
+        const flushNow = page
+          .evaluate((g) => window.__wpJarvisAudio?.flushOutgoingPcm?.(g) ?? 0, targetGen)
+          .catch(() => 0);
+        const flushAfterChain = () =>
+          ended || !page
+            ? 0
+            : page
+                .evaluate((g) => window.__wpJarvisAudio?.flushOutgoingPcm?.(g) ?? 0, targetGen)
+                .catch(() => 0);
+        outgoingChain = outgoingChain.then(flushAfterChain, flushAfterChain);
+        const [res] = await Promise.all([flushNow, outgoingChain]);
+        return res;
       },
       async hangUp(reason = 'caller_hangup') {
         if (finalizePromise) return finalizePromise;
+        const isStartupError =
+          reason === 'live_session_start_failed' ||
+          (!wasConnected && reason === 'live_session_error');
+        if (isStartupError) {
+          hasError = true;
+          return finalize('error', { reason, shouldClickHangup: true });
+        }
         if (!wasConnected) {
           if (reason === 'ring_timeout') {
             timedOut = true;
@@ -493,12 +519,22 @@ export function createCallController({
         page.on('close', onPageClose);
       }
 
+      const ringTimeoutMs = isIncoming
+        ? toTimeoutMs(config.callAnswerConnectTimeoutSec ?? config.callRingTimeoutSec, 20)
+        : toTimeoutMs(config.callRingTimeoutSec, 35);
+
       if (isIncoming) {
         await ensureHookPresent(page, hookScript);
         if (ended) return session;
         bridge = await ensurePageBridge(page);
       } else {
-        const navResult = await openOwnerChat(page, ownerPhone, ownerChatId, chatOpenSettleMs);
+        const navResult = await openOwnerChat(
+          page,
+          ownerPhone,
+          ownerChatId,
+          chatOpenSettleMs,
+          Math.min(5000, ringTimeoutMs)
+        );
         if (ended) return session;
         if (navResult.navigated) {
           bridge = await verifyOrReinstateBridgeAfterNavigation(page, hookScript);
@@ -529,6 +565,10 @@ export function createCallController({
         for (const p of initTelemetry.peerConnections) {
           if (!isPcTerminal(p, false)) {
             preExistingActivePcIds.add(p.id);
+            callPcStates.set(p.id, {
+              connectionState: p.connectionState || 'new',
+              iceConnectionState: p.iceConnectionState || 'new',
+            });
           }
         }
       }
@@ -563,10 +603,18 @@ export function createCallController({
         if (!wasConnected) {
           if (isIncoming) {
             timedOut = true;
-            void finalize('missed', { reason: 'webrtc_closed_while_ringing', evt });
+            void finalize('missed', {
+              reason: 'webrtc_closed_while_ringing',
+              evt,
+              shouldClickHangup: true,
+            });
           } else {
             endedEarlyWhileRinging = true;
-            void finalize('rejected', { reason: 'webrtc_closed_while_ringing', evt });
+            void finalize('rejected', {
+              reason: 'webrtc_closed_while_ringing',
+              evt,
+              shouldClickHangup: true,
+            });
           }
         } else {
           void finalize('answered', { reason: 'remote_webrtc_closed', evt });
@@ -606,9 +654,6 @@ export function createCallController({
       }
 
       ringStartedAt = Date.now();
-      const ringTimeoutMs = isIncoming
-        ? toTimeoutMs(config.callAnswerConnectTimeoutSec ?? config.callRingTimeoutSec, 20)
-        : toTimeoutMs(config.callRingTimeoutSec, 35);
       ringTimer = setTimeout(() => {
         if (ended || wasConnected) return;
         void session.hangUp('ring_timeout');
@@ -692,12 +737,14 @@ export function createCallController({
                   : pcEndedEarly
                     ? 'webrtc_closed_while_ringing'
                     : 'dom_closed_while_ringing';
+              const extra =
+                reason === 'webrtc_closed_while_ringing' ? { shouldClickHangup: true } : {};
               if (isIncoming) {
                 timedOut = true;
-                await finalize('missed', { reason });
+                await finalize('missed', { reason, ...extra });
               } else {
                 endedEarlyWhileRinging = true;
-                await finalize('rejected', { reason });
+                await finalize('rejected', { reason, ...extra });
               }
             }
             return;

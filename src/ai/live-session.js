@@ -1,5 +1,6 @@
 import { GoogleGenAI as DefaultGoogleGenAI, Modality } from '@google/genai';
 import { TOOL_DECLARATIONS } from './tools.js';
+import { normalizeTurkishText } from '../utils/text.js';
 
 const MAX_CANCELLED_TOOL_IDS = 200;
 
@@ -17,7 +18,7 @@ export function resolveStyleProfile(config, assistantName) {
     return { systemLine: '', greetingHint: '' };
   }
 
-  const normalizedKey = rawStyle.toLowerCase().replace(/ı/g, 'i');
+  const normalizedKey = normalizeTurkishText(rawStyle);
   if (normalizedKey === 'diyarbakir') {
     return {
       systemLine:

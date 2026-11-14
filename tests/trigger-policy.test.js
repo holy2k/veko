@@ -425,3 +425,70 @@ test('enforces on_demand call policy via config or runtime store override', () =
   assert.equal(res2.reason, 'on_demand_policy');
   assert.equal(store.getPendingCallChatId(), null);
 });
+
+test('strips device tags on targetChatId, guards @lid in fromMe owner check, uses isSameChatIdentity for pendingCallChatId, and merges @c.us cooldowns for @lid events with phone', () => {
+  const store = makeStore();
+  const now = 20_000_000;
+
+  // 1. Device tag stripped on incoming customer JID
+  const devRes = evaluateIncomingMessage(
+    { id: 'dev-1', from: '905551234567:14@c.us', fromMe: false, body: 'Merhaba' },
+    { config: cfg, store, callInProgress: false, nowMs: now }
+  );
+  assert.equal(devRes.action, 'notify_and_call');
+  assert.equal(devRes.targetChatId, '905551234567@c.us');
+  assert.equal(store.getPendingCallChatId(), '905551234567@c.us');
+
+  // 2. fromMe human reply with equivalent identity (05XX or device tag) clears pendingCallChatId via isSameChatIdentity
+  const replyRes = evaluateIncomingMessage(
+    { id: 'dev-2', to: '05551234567:3@c.us', fromMe: true, body: 'Hemen bakıyorum' },
+    { config: cfg, store, callInProgress: false, nowMs: now + 1000 }
+  );
+  assert.equal(replyRes.action, 'update_owner_reply');
+  assert.equal(replyRes.targetChatId, '05551234567@c.us');
+  assert.equal(store.getPendingCallChatId(), null);
+
+  // 3. fromMe to @lid whose digits match ownerPhone WITHOUT matching event.phone is NOT treated as owner self-chat
+  const fakeLidOwnerDigits = `${cfg.ownerPhone}@lid`;
+  const lidCustomerFromMe = evaluateIncomingMessage(
+    { id: 'lid-fm-1', to: fakeLidOwnerDigits, fromMe: true, body: 'durum' },
+    { config: cfg, store, callInProgress: false, nowMs: now + 2000 }
+  );
+  assert.equal(lidCustomerFromMe.action, 'update_owner_reply');
+
+  // When event.phone matches ownerPhone on @lid fromMe, it IS treated as owner self-chat
+  const realLidOwnerFromMe = evaluateIncomingMessage(
+    { id: 'lid-fm-2', to: '888999000@lid', phone: cfg.ownerPhone, fromMe: true, body: 'durum' },
+    { config: cfg, store, callInProgress: false, nowMs: now + 3000 }
+  );
+  assert.equal(realLidOwnerFromMe.action, 'owner_command');
+  assert.equal(realLidOwnerFromMe.command.type, 'status');
+
+  // 4. @lid incoming customer message with resolved event.phone merges cooldowns from @c.us
+  const supplierPhone = '905559998877';
+  const supplierCus = `${supplierPhone}@c.us`;
+  const supplierLid = '1234567890@lid';
+  store.updateChatState(supplierCus, { thirdPartyOutreachUntil: now + 3600_000 });
+
+  const lidOutreachRes = evaluateIncomingMessage(
+    { id: 'lid-cd-1', from: supplierLid, phone: supplierPhone, fromMe: false, body: 'Fiyat listesi ektedir' },
+    { config: cfg, store, callInProgress: false, nowMs: now + 5000 }
+  );
+  assert.equal(lidOutreachRes.action, 'notify_only');
+  assert.equal(lidOutreachRes.reason, 'third_party_outreach');
+
+  // Also merges lastTextReplyAt, lastOwnerReplyAt, and most recent lastCallAt/lastCallStatus/missedRetryCount
+  const custPhone = '905554443322';
+  const custCus = `${custPhone}@c.us`;
+  const custLid = '9988776655@lid';
+  store.updateChatState(custLid, { lastCallAt: now - 180 * 60_000, lastCallStatus: 'answered' });
+  store.updateChatState(custCus, { lastCallAt: now - 10 * 60_000, lastCallStatus: 'rejected', missedRetryCount: 0 });
+
+  const lidCallCdRes = evaluateIncomingMessage(
+    { id: 'lid-cd-2', from: custLid, phone: custPhone, fromMe: false, body: 'Tekrar merhaba' },
+    { config: cfg, store, callInProgress: false, nowMs: now }
+  );
+  assert.equal(lidCallCdRes.action, 'notify_only');
+  assert.equal(lidCallCdRes.reason, 'rejected_cooldown');
+});
+

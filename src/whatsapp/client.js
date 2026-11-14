@@ -84,6 +84,9 @@ export function resolveChromeExecutablePath(config = {}, deps = {}) {
       : []),
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
     'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    ...(env.LOCALAPPDATA
+      ? [path.join(env.LOCALAPPDATA, 'Microsoft', 'Edge', 'Application', 'msedge.exe')]
+      : []),
   ];
 
   const puppeteerBinary = getPuppeteerPath();
@@ -349,7 +352,8 @@ async function normalizeIncomingMessage(msg, client, ownerChatId = '') {
               targetContact.shortName ||
               senderName;
           }
-        } else if (typeof client.getChatById === 'function' && to) {
+        }
+        if (!senderName && typeof client.getChatById === 'function' && to) {
           const targetChat = await client.getChatById(to);
           if (targetChat?.name) {
             senderName = targetChat.name;
@@ -473,12 +477,15 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
     evalOnNewDoc: hookScript,
   });
 
+  const hookRegisteredPages = new WeakSet();
+
   async function ensureHookInjected() {
     const page = client.pupPage;
     if (!page) return;
     try {
-      if (typeof page.evaluateOnNewDocument === 'function') {
+      if (!hookRegisteredPages.has(page) && typeof page.evaluateOnNewDocument === 'function') {
         await page.evaluateOnNewDocument(hookScript);
+        hookRegisteredPages.add(page);
       }
       if (typeof page.evaluate === 'function') {
         await page.evaluate((src) => {
@@ -551,6 +558,7 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
       if (typeof page.evaluate === 'function') {
         await page.evaluate(() => {
           if (window.__wpJarvisCallObserverAttached) return true;
+          if (typeof window.__wpJarvisOnWaIncomingCall !== 'function') return false;
           if (typeof window.require !== 'function') return false;
           const col = window.require('WAWebCallCollection');
           if (!col || typeof col.on !== 'function') return false;
@@ -569,7 +577,16 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
               }
               return;
             }
-            if (attrs.outgoing) return;
+            if (attrs.outgoing) {
+              if (lastNotifiedCallId) {
+                const endedId = lastNotifiedCallId;
+                lastNotifiedCallId = null;
+                if (typeof window.__wpJarvisOnWaCallEnded === 'function') {
+                  window.__wpJarvisOnWaCallEnded(endedId);
+                }
+              }
+              return;
+            }
             const callId = String(attrs.id);
             lastNotifiedCallId = callId;
             if (typeof window.__wpJarvisOnWaIncomingCall === 'function') {
@@ -805,7 +822,8 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
       }
       const lidMap = await resolveLidsBatch(client, lidSet);
 
-      const mapped = userChats.map((ch) => {
+      const byChatId = new Map();
+      for (const ch of userChats) {
         const rawId = stripJidDeviceTag(extractSerializedId(ch.id));
         const lidEntry = rawId.endsWith('@lid') ? lidMap.get(rawId) : null;
         const chatId = lidEntry?.chatId || rawId;
@@ -814,17 +832,46 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
         const timestamp = Number(lastMsg?.timestamp ?? ch.timestamp ?? 0) || 0;
         const unreadCount = Number(ch.unreadCount || 0) || 0;
         const timestampIso = formatTimestampToIstanbulIso(timestamp);
+        const rawName = (ch.name || '').trim();
+        const name = rawName || phone || chatId;
+        const hasCustomName = Boolean(
+          rawName && rawName !== phone && rawName !== chatId && rawName !== rawId
+        );
 
-        return {
-          chatId,
-          name: (ch.name || '').trim() || phone || chatId,
-          phone,
-          unreadCount,
-          timestamp,
-          timestampIso,
-          lastMessage: lastMsg,
-        };
-      });
+        const existing = byChatId.get(chatId);
+        if (!existing) {
+          byChatId.set(chatId, {
+            chatId,
+            name,
+            hasCustomName,
+            phone,
+            unreadCount,
+            timestamp,
+            timestampIso,
+            lastMessage: lastMsg,
+          });
+        } else {
+          existing.unreadCount += unreadCount;
+          if (!existing.phone && phone) {
+            existing.phone = phone;
+          }
+          if (timestamp > existing.timestamp) {
+            existing.timestamp = timestamp;
+            existing.timestampIso = timestampIso;
+            existing.lastMessage = lastMsg;
+          } else if (!existing.lastMessage && lastMsg) {
+            existing.lastMessage = lastMsg;
+          }
+          if (hasCustomName && (!existing.hasCustomName || !rawId.endsWith('@lid'))) {
+            existing.name = rawName;
+            existing.hasCustomName = true;
+          } else if (!existing.hasCustomName && name) {
+            existing.name = name;
+          }
+        }
+      }
+
+      const mapped = Array.from(byChatId.values()).map(({ hasCustomName, ...entry }) => entry);
 
       mapped.sort((a, b) => b.timestamp - a.timestamp);
       return mapped.slice(0, cappedLimit);
@@ -879,58 +926,145 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
       }
       const lidMap = await resolveLidsBatch(client, lidSet);
 
+      const normalizedOwnerChatId = stripJidDeviceTag(ownerChatId || '');
+      let ownerLidSet = null;
+      const hasUnresolvedLid = Array.from(lidSet).some((lid) => !lidMap.has(lid));
+      if (
+        hasUnresolvedLid &&
+        normalizedOwnerChatId &&
+        typeof client?.getContactLidAndPhone === 'function'
+      ) {
+        ownerLidSet = new Set();
+        try {
+          const mapped = await client.getContactLidAndPhone([normalizedOwnerChatId]);
+          const items = Array.isArray(mapped) ? mapped : mapped ? [mapped] : [];
+          const expectedOwnerPhone = normalizePhone(normalizedOwnerChatId);
+          for (const entry of items) {
+            const ownerLid = stripJidDeviceTag(entry?.lid || '');
+            const entryPn = stripJidDeviceTag(entry?.pn || '');
+            if (ownerLid && (!entryPn || normalizePhone(entryPn) === expectedOwnerPhone)) {
+              ownerLidSet.add(ownerLid);
+            }
+          }
+        } catch {
+          // Ignore reverse @lid lookup failures
+        }
+      }
+
+      const groupedByChatId = new Map();
+      for (const ch of userChats) {
+        const rawId = stripJidDeviceTag(extractSerializedId(ch.id));
+        const lidEntry = rawId.endsWith('@lid') ? lidMap.get(rawId) : null;
+        let chatId = lidEntry?.chatId || rawId;
+        if (chatId.endsWith('@lid') && ownerLidSet?.has(chatId)) {
+          chatId = normalizedOwnerChatId;
+        }
+        const phone = lidEntry?.phone || (chatId.endsWith('@lid') ? '' : normalizePhone(chatId));
+        const rawName = (ch.name || '').trim();
+        const name = rawName || phone || chatId;
+        const hasCustomName = Boolean(
+          rawName && rawName !== phone && rawName !== chatId && rawName !== rawId
+        );
+
+        const existing = groupedByChatId.get(chatId);
+        if (!existing) {
+          groupedByChatId.set(chatId, {
+            chatId,
+            rawIds: new Set([rawId]),
+            chats: [ch],
+            phone,
+            name,
+            hasCustomName,
+          });
+        } else {
+          existing.rawIds.add(rawId);
+          existing.chats.push(ch);
+          if (!existing.phone && phone) {
+            existing.phone = phone;
+          }
+          if (hasCustomName && (!existing.hasCustomName || !rawId.endsWith('@lid'))) {
+            existing.name = rawName;
+            existing.hasCustomName = true;
+          } else if (!existing.hasCustomName && name) {
+            existing.name = name;
+          }
+        }
+      }
+
       let skippedByPreFilter = 0;
       let excludedThirdPartyCount = 0;
       let excludedOwnerOrExplicitCount = 0;
       let excludedOutboundOnlyCount = 0;
       const candidates = [];
 
-      for (const ch of userChats) {
-        const rawId = stripJidDeviceTag(extractSerializedId(ch.id));
-        const lidEntry = rawId.endsWith('@lid') ? lidMap.get(rawId) : null;
-        let chatId = lidEntry?.chatId || rawId;
-        if (chatId.endsWith('@lid') && ownerChatId) {
-          chatId = await resolveReverseOwnerLid(client, chatId, ownerChatId);
-        }
+      for (const group of groupedByChatId.values()) {
+        const { chatId, rawIds, chats: groupChats, phone, name } = group;
+        const rawIdList = Array.from(rawIds);
 
-        if (isExcluded(chatId) || (rawId !== chatId && isExcluded(rawId))) {
+        if (isExcluded(chatId) || rawIdList.some((rId) => rId !== chatId && isExcluded(rId))) {
           excludedOwnerOrExplicitCount += 1;
           continue;
         }
 
-        const chatState =
-          store && typeof store.getChatState === 'function'
-            ? store.getChatState(chatId)
-            : {};
+        const stateKeys = new Set([chatId, ...rawIdList]);
+        let thirdPartyOutreachUntil = null;
+        let lastCustomerMessageAt = 0;
+        let firstSeenAt = null;
 
-        if (
-          typeof chatState?.thirdPartyOutreachUntil === 'number' &&
-          nowMs < chatState.thirdPartyOutreachUntil
-        ) {
+        if (store && typeof store.getChatState === 'function') {
+          for (const key of stateKeys) {
+            const st = store.getChatState(key);
+            if (!st) continue;
+            if (
+              typeof st.thirdPartyOutreachUntil === 'number' &&
+              (thirdPartyOutreachUntil === null || st.thirdPartyOutreachUntil > thirdPartyOutreachUntil)
+            ) {
+              thirdPartyOutreachUntil = st.thirdPartyOutreachUntil;
+            }
+            if (Number(st.lastCustomerMessageAt || 0) > lastCustomerMessageAt) {
+              lastCustomerMessageAt = Number(st.lastCustomerMessageAt || 0);
+            }
+            if (
+              Number.isFinite(st.firstSeenAt) &&
+              st.firstSeenAt > 0 &&
+              (firstSeenAt === null || st.firstSeenAt < firstSeenAt)
+            ) {
+              firstSeenAt = st.firstSeenAt;
+            }
+          }
+        }
+
+        if (typeof thirdPartyOutreachUntil === 'number' && nowMs < thirdPartyOutreachUntil) {
           excludedThirdPartyCount += 1;
           continue;
         }
 
-        const lastActivityMs = Math.max(
-          toMs(ch.lastMessage?.timestamp ?? 0),
-          toMs(ch.timestamp ?? 0),
-          Number(chatState?.lastCustomerMessageAt || 0)
-        );
+        let lastActivityMs = lastCustomerMessageAt;
+        for (const ch of groupChats) {
+          lastActivityMs = Math.max(
+            lastActivityMs,
+            toMs(ch.lastMessage?.timestamp ?? 0),
+            toMs(ch.timestamp ?? 0)
+          );
+        }
 
         if (Number.isFinite(rangeStartMs) && lastActivityMs > 0 && lastActivityMs < rangeStartMs) {
           skippedByPreFilter += 1;
           continue;
         }
 
-        const phone = lidEntry?.phone || (chatId.endsWith('@lid') ? '' : normalizePhone(chatId));
-        const name = (ch.name || '').trim() || phone || chatId;
         candidates.push({
-          chat: ch,
+          chat: groupChats[0],
+          chats: groupChats,
           chatId,
           phone,
           name,
           lastActivityMs,
-          chatState,
+          chatState: {
+            ...(thirdPartyOutreachUntil !== null ? { thirdPartyOutreachUntil } : {}),
+            ...(lastCustomerMessageAt > 0 ? { lastCustomerMessageAt } : {}),
+            ...(firstSeenAt !== null ? { firstSeenAt } : {}),
+          },
         });
       }
 
@@ -950,12 +1084,31 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
       async function runWorker() {
         while (nextIdx < batch.length) {
           const item = batch[nextIdx++];
-          const msgs =
-            typeof item.chat.fetchMessages === 'function'
-              ? await item.chat.fetchMessages({ limit: historyLimit }).catch(() => [])
-              : [];
+          const chatList = Array.isArray(item.chats) && item.chats.length > 0 ? item.chats : [item.chat];
+          const msgs = [];
+          const seenMsgIds = new Set();
+          let historyReachedLimit = false;
 
-          const allInRange = (msgs || []).filter((m) => {
+          for (const ch of chatList) {
+            const fetched =
+              typeof ch?.fetchMessages === 'function'
+                ? await ch.fetchMessages({ limit: historyLimit }).catch(() => [])
+                : [];
+            if ((fetched || []).length >= historyLimit) {
+              historyReachedLimit = true;
+            }
+            for (const m of fetched || []) {
+              if (!m) continue;
+              const msgId = extractSerializedId(m.id);
+              if (msgId) {
+                if (seenMsgIds.has(msgId)) continue;
+                seenMsgIds.add(msgId);
+              }
+              msgs.push(m);
+            }
+          }
+
+          const allInRange = msgs.filter((m) => {
             if (!m) return false;
             const ts = toMs(m.timestamp);
             if (!ts) return false;
@@ -964,7 +1117,7 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
             return true;
           });
 
-          const incoming = (msgs || []).filter((m) => m && !m.fromMe);
+          const incoming = msgs.filter((m) => m && !m.fromMe);
           const inRange = allInRange.filter((m) => !m.fromMe);
 
           if (inRange.length === 0) {
@@ -983,7 +1136,6 @@ export function createWhatsAppClient(config = {}, handlers = {}, deps = {}) {
               const ts = toMs(m.timestamp);
               return ts > 0 && Number.isFinite(rangeStartMs) && ts < rangeStartMs;
             });
-          const historyReachedLimit = (msgs || []).length >= historyLimit;
           const isNew = hadEarlierIncoming ? false : historyReachedLimit ? null : true;
 
           customers.push({

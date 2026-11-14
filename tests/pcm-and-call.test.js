@@ -11,7 +11,10 @@ import {
   classifyCallOutcome,
 } from '../src/whatsapp/call-controller.js';
 import {
+  AUDIO_CALL_SELECTORS,
+  HANGUP_SELECTORS,
   INCOMING_ACCEPT_SELECTORS,
+  analyzeCallDomFromDocument,
   selectClickableCandidate,
 } from '../scripts/spike-webrtc-call.js';
 import { getBrowserHookScript } from '../src/whatsapp/injected-hook.js';
@@ -1201,3 +1204,423 @@ test('selectClickableCandidate ignores buttons inside #pane-side chat list', () 
   assert.equal(chosen, null);
   assert.equal(sidebarBtn.clicked, false);
 });
+
+test('injected-hook prevents dual-capture corruption, cleans up webaudio_dest/destinations, caps peerConnections, and guards outFlushGen & closed contexts', async () => {
+  class FakeDestinationNode {}
+  class FakeAudioNode {
+    constructor(ctx) {
+      this.context = ctx;
+      this.connectedTo = [];
+      this.disconnected = false;
+      this._listeners = new Map();
+    }
+    connect(dest) {
+      this.connectedTo.push(dest);
+      return dest;
+    }
+    disconnect() {
+      this.disconnected = true;
+    }
+    addEventListener(ev, fn) {
+      this._listeners.set(ev, fn);
+    }
+    emit(ev) {
+      this._listeners.get(ev)?.();
+    }
+  }
+
+  const processors = [];
+  const createdContexts = [];
+  class FakeAudioContext {
+    constructor() {
+      this.sampleRate = 16000;
+      this.currentTime = 1.0;
+      this.state = 'running';
+      this.destination = new FakeDestinationNode();
+      this.audioWorklet = null;
+      createdContexts.push(this);
+    }
+    createGain() {
+      const n = new FakeAudioNode(this);
+      n.gain = { value: 1 };
+      return n;
+    }
+    createConstantSource() {
+      const n = new FakeAudioNode(this);
+      n.offset = { value: 0 };
+      n.start = () => {};
+      return n;
+    }
+    createBuffer(c, l, r) {
+      return {
+        numberOfChannels: c,
+        length: l,
+        sampleRate: r,
+        duration: l / r,
+        _data: new Float32Array(l),
+        getChannelData() {
+          return this._data;
+        },
+      };
+    }
+    createBufferSource() {
+      const n = new FakeAudioNode(this);
+      n.start = () => {};
+      n.stop = () => {
+        n.stopped = true;
+      };
+      return n;
+    }
+    createMediaStreamDestination() {
+      const trackListeners = new Map();
+      const track = {
+        kind: 'audio',
+        enabled: true,
+        readyState: 'live',
+        addEventListener: (ev, fn) => trackListeners.set(ev, fn),
+        stop() {
+          this.readyState = 'ended';
+          trackListeners.get('ended')?.();
+        },
+      };
+      return { stream: { getAudioTracks: () => [track], getTracks: () => [track] } };
+    }
+    createMediaStreamSource() {
+      return new FakeAudioNode(this);
+    }
+    createScriptProcessor() {
+      const n = new FakeAudioNode(this);
+      n.onaudioprocess = null;
+      processors.push(n);
+      return n;
+    }
+    resume() {
+      return Promise.resolve();
+    }
+  }
+
+  class FakeRTCPeerConnection {
+    constructor() {
+      this.connectionState = 'new';
+      this.iceConnectionState = 'new';
+      this.signalingState = 'stable';
+      this._listeners = new Map();
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners.has(type)) this._listeners.set(type, []);
+      this._listeners.get(type).push(fn);
+    }
+    emit(type, evt = {}) {
+      for (const fn of this._listeners.get(type) || []) fn(evt);
+    }
+  }
+
+  class FakeMediaStream {
+    constructor(tracks = []) {
+      this._tracks = tracks;
+    }
+    getTracks() {
+      return this._tracks;
+    }
+  }
+
+  const vmCtx = {
+    window: null,
+    navigator: { mediaDevices: { getUserMedia: async () => ({}) } },
+    AudioContext: FakeAudioContext,
+    AudioNode: FakeAudioNode,
+    AudioDestinationNode: FakeDestinationNode,
+    RTCPeerConnection: FakeRTCPeerConnection,
+    MediaStream: FakeMediaStream,
+    Float32Array,
+    Int16Array,
+    Uint8Array,
+    ArrayBuffer,
+    Math,
+    Date,
+    Number,
+    String,
+    Boolean,
+    Array,
+    Promise,
+    Set,
+    setTimeout,
+    clearTimeout,
+    atob: (b64) => {
+      if (b64 === '!!!invalid-base64!!!') throw new Error('InvalidCharacterError');
+      return Buffer.from(b64, 'base64').toString('binary');
+    },
+    btoa: (str) => Buffer.from(str, 'binary').toString('base64'),
+  };
+  vmCtx.window = vmCtx;
+  vm.createContext(vmCtx);
+  vm.runInContext(getBrowserHookScript(), vmCtx);
+
+  const api = vmCtx.__wpJarvisAudio;
+
+  // 1. Dual-capture prevention: webaudio_dest captures when no WebRTC track is active,
+  //    is suppressed while a WebRTC audio track is active, and resumes when PC closes.
+  const waCtx = new FakeAudioContext();
+  const waSource = new FakeAudioNode(waCtx);
+  waSource.connect(waCtx.destination);
+  const webAudioProc = processors[0];
+  assert.ok(webAudioProc);
+
+  api.startIncomingCapture();
+  const frame = new Float32Array(160).fill(0.5);
+  webAudioProc.onaudioprocess({ inputBuffer: { getChannelData: () => frame } });
+  assert.equal(api.drainIncomingPcm().length, 160, 'webaudio_dest captures when no WebRTC track active');
+
+  const pc = new vmCtx.RTCPeerConnection({});
+  const trackListeners = new Map();
+  pc.emit('track', {
+    track: { kind: 'audio', addEventListener: (ev, fn) => trackListeners.set(ev, fn) },
+    streams: [{}],
+  });
+  const webrtcProc = processors[1];
+  assert.ok(webrtcProc);
+
+  // While WebRTC track is active, webaudio_dest frames MUST be ignored!
+  webAudioProc.onaudioprocess({ inputBuffer: { getChannelData: () => frame } });
+  assert.equal(api.drainIncomingPcm().length, 0, 'webaudio_dest must be ignored while WebRTC track is active');
+
+  webrtcProc.onaudioprocess({ inputBuffer: { getChannelData: () => frame } });
+  assert.equal(api.drainIncomingPcm().length, 160, 'webrtc_track frame is captured normally');
+
+  // Owning PC transitioning to 'closed' cleans up the WebRTC track capture and decrements activeWebrtcTrackCount
+  pc.connectionState = 'closed';
+  pc.emit('connectionstatechange');
+  assert.equal(webrtcProc.disconnected, true);
+
+  webAudioProc.onaudioprocess({ inputBuffer: { getChannelData: () => frame } });
+  assert.equal(api.drainIncomingPcm().length, 160, 'webaudio_dest fallback resumes after PC closes');
+
+  // 2. configureBridge({ enabled: false }) cleans up webAudioDestCleanups
+  api.configureBridge({ enabled: false });
+  assert.equal(webAudioProc.disconnected, true, 'webAudioDest processor disconnected when bridge disabled');
+
+  // Re-tapping and sourceNode 'ended' cleanup
+  const waSource2 = new FakeAudioNode(waCtx);
+  waSource2.connect(waCtx.destination);
+  const webAudioProc2 = processors[processors.length - 1];
+  waSource2.emit('ended');
+  assert.equal(webAudioProc2.disconnected, true, 'sourceNode ended event cleans up tap');
+
+  // 3. Cap state.peerConnections to 50 entries
+  for (let i = 0; i < 60; i++) {
+    new vmCtx.RTCPeerConnection({});
+  }
+  assert.equal(api.getTelemetry().peerConnections.length, 50, 'peerConnections capped at 50');
+
+  // 4. Browser-side outFlushGen & malformed base64 guard & closed outCtx/inCtx recreation
+  assert.equal(api.pushOutgoingBase64Pcm('!!!invalid-base64!!!', 24000), 0, 'malformed base64 returns 0');
+  const validB64 = int16ToBase64(new Int16Array([1000, -1000]));
+  assert.equal(api.pushOutgoingBase64Pcm(validB64, 24000, 0), 2);
+  const gen1 = api.flushOutgoingPcm();
+  assert.equal(gen1, 1);
+  assert.equal(api.pushOutgoingBase64Pcm(validB64, 24000, 0), 0, 'stale expectedGen < outFlushGen is dropped');
+  assert.equal(api.pushOutgoingBase64Pcm(validB64, 24000, 1), 2, 'current expectedGen === outFlushGen is accepted');
+
+  // Closed outCtx and inCtx are recreated cleanly
+  for (const c of createdContexts) {
+    c.state = 'closed';
+  }
+  const ctxCountBefore = createdContexts.length;
+  assert.equal(api.pushOutgoingBase64Pcm(validB64, 24000), 2);
+  const pcNew = new vmCtx.RTCPeerConnection({});
+  pcNew.emit('track', { track: { kind: 'audio', addEventListener() {} }, streams: [{}] });
+  assert.ok(createdContexts.length >= ctxCountBefore + 2, 'closed outCtx and inCtx are recreated');
+
+  // Invalid sampleRate in incoming frame does not hang resampler
+  const latestProc = processors[processors.length - 1];
+  latestProc.context.sampleRate = -48000;
+  latestProc.onaudioprocess({ inputBuffer: { getChannelData: () => frame } });
+});
+
+test('selectClickableCandidate skips disabled elements and only prefers header for AUDIO_CALL_SELECTORS', () => {
+  const root = makeDomElement({ id: 'app', matchFn: (s) => s === '#app' });
+  const main = makeDomElement({ id: 'main', parent: root, matchFn: (s) => s === '#main' });
+  const header = makeDomElement({
+    tagName: 'HEADER',
+    parent: main,
+    matchFn: (s) => s === 'header' || s === '#main header',
+  });
+
+  // Disabled header call button must be skipped in favor of enabled button
+  const disabledCallBtn = makeDomElement({
+    tagName: 'BUTTON',
+    attrs: { 'data-icon': 'audio-call', 'aria-label': 'Disabled call', 'aria-disabled': 'true' },
+    parent: header,
+    matchFn: (s) => s === '[data-icon="audio-call"]' || s === 'button',
+  });
+  const enabledCallBtn = makeDomElement({
+    tagName: 'BUTTON',
+    attrs: { 'data-icon': 'audio-call', 'aria-label': 'Enabled call' },
+    parent: header,
+    matchFn: (s) => s === '[data-icon="audio-call"]' || s === 'button',
+  });
+
+  const doc = {
+    querySelectorAll: (s) => root.querySelectorAll(s),
+    querySelector: (s) => root.querySelector(s),
+  };
+  const pickedCall = selectClickableCandidate(AUDIO_CALL_SELECTORS, doc, true);
+  assert.equal(pickedCall.ariaLabel, 'Enabled call');
+  assert.equal(disabledCallBtn.clicked, false);
+  assert.equal(enabledCallBtn.clicked, true);
+
+  // For HANGUP_SELECTORS, a floating overlay button outside header (first in DOM) must NOT be overridden by a header button
+  const overlayHangup = makeDomElement({
+    tagName: 'BUTTON',
+    attrs: { 'data-icon': 'call-end', 'aria-label': 'Overlay hangup' },
+    parent: root,
+    matchFn: (s) => s === '[data-icon="call-end"]' || s === 'button',
+  });
+  const headerHangup = makeDomElement({
+    tagName: 'BUTTON',
+    attrs: { 'data-icon': 'call-end', 'aria-label': 'Header hangup' },
+    parent: header,
+    matchFn: (s) => s === '[data-icon="call-end"]' || s === 'button',
+  });
+  // Place overlayHangup before main in root.children
+  root.children = [overlayHangup, main];
+  const pickedHangup = selectClickableCandidate(HANGUP_SELECTORS, doc, false);
+  assert.equal(pickedHangup.ariaLabel, 'Overlay hangup');
+  assert.equal(headerHangup.clicked, false);
+});
+
+test('analyzeCallDomFromDocument ignores generic dialog without call signals, suppresses lines.find timer while ringing, and supports hour timers', () => {
+  const root = makeDomElement({ id: 'app', matchFn: (s) => s === '#app' });
+  const genericModal = makeDomElement({
+    attrs: { role: 'dialog' },
+    parent: root,
+    innerText: 'Mesajı silmek istiyor musunuz?\n00:12\nİptal\nSil',
+    matchFn: (s) => s === '[role="dialog"]',
+  });
+  const doc = {
+    body: { innerText: '', matches: () => false },
+    querySelector: (s) => root.querySelector(s),
+    querySelectorAll: (s) => root.querySelectorAll(s),
+  };
+
+  // Generic [role="dialog"] when !hangupPresent and no call status hints -> hasCallContainer: false, timerText: null
+  const genericState = analyzeCallDomFromDocument(HANGUP_SELECTORS, doc);
+  assert.deepEqual(genericState, {
+    hangupPresent: false,
+    timerText: null,
+    statusHints: [],
+    hasCallContainer: false,
+  });
+
+  // Dialog with call status hint when !hangupPresent -> hasCallContainer: true, statusHints preserved, ringing suppresses fallback timer
+  genericModal.innerText = 'Ahmet\nAranıyor\n0:05';
+  const ringingState = analyzeCallDomFromDocument(HANGUP_SELECTORS, doc);
+  assert.equal(ringingState.hasCallContainer, true);
+  assert.deepEqual(ringingState.statusHints, ['Aranıyor']);
+  assert.equal(ringingState.timerText, null, 'fallback lines.find timer must be suppressed while ringing');
+
+  // Explicit [role="timer"] with hours (1:02:03) inside voip-container is recognized
+  genericModal.attrs['data-testid'] = 'voip-container';
+  genericModal.matches = (s) => s === '[role="dialog"]' || s.includes('voip-container');
+  genericModal.innerText = 'Ahmet\n1:02:03';
+  makeDomElement({
+    attrs: { role: 'timer', 'data-testid': 'voip-call-timer' },
+    parent: genericModal,
+    innerText: '1:02:03',
+    matchFn: (s) => s.includes('voip-call-timer') || s.includes('[role="timer"]'),
+  });
+  const hourTimerState = analyzeCallDomFromDocument(HANGUP_SELECTORS, doc);
+  assert.equal(hourTimerState.timerText, '1:02:03');
+});
+
+test('createCallController seeds preExistingActivePcIds states, clicks hangup on webrtc_closed_while_ringing, bounds openOwnerChat timeout, and marks live_session_start_failed as error', async () => {
+  // 1. Seed callPcStates for all preExistingActivePcIds on incoming call
+  const envIn = makeFakeCallPage({ withCallButton: false });
+  const acceptBtn = makeDomElement({
+    tagName: 'BUTTON',
+    attrs: { 'aria-label': 'Kabul et' },
+    innerText: 'Kabul et',
+    matchFn: (s) => s === 'button[aria-label="Kabul et" i]' || s === 'button',
+  });
+  const origQueryAll = envIn.vmContext.document.querySelectorAll;
+  envIn.vmContext.document.querySelectorAll = (sel) => {
+    const base = origQueryAll(sel);
+    const parts = sel.split(',').map((s) => s.trim());
+    return parts.some((p) => acceptBtn.matches(p)) && acceptBtn._visible !== false
+      ? [acceptBtn, ...base]
+      : base;
+  };
+
+  // Two pre-existing active PCs created before answerIncomingCall
+  const prePc1 = new envIn.vmContext.window.RTCPeerConnection({});
+  const prePc2 = new envIn.vmContext.window.RTCPeerConnection({});
+  prePc1.connectionState = 'connecting';
+  prePc2.connectionState = 'connecting';
+  prePc1.emit('connectionstatechange');
+  prePc2.emit('connectionstatechange');
+
+  let hangupClicks = 0;
+  acceptBtn.onClick = () => {
+    acceptBtn._visible = false;
+    const { hangupBtn } = envIn.showCallOverlay('İşletme Sahibi\nBağlanıyor...');
+    hangupBtn.onClick = () => {
+      hangupClicks += 1;
+    };
+  };
+
+  const ctrlIn = createCallController({
+    client: { getPage: () => envIn.page },
+    config: { ownerPhone: '905321112233', ownerChatId: '905321112233@c.us', callRingTimeoutSec: 5 },
+    pollIntervalMs: 15,
+    earlyCloseGraceMs: 40,
+    chatOpenSettleMs: 5,
+  });
+
+  const sIn = await ctrlIn.answerIncomingCall({});
+  // Closing only prePc1 while prePc2 is still 'connecting' must NOT finalize call!
+  prePc1.connectionState = 'closed';
+  prePc1.emit('connectionstatechange');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(ctrlIn.isCallActive(), true, 'closing 1 of 2 seeded pre-existing PCs must not end call');
+
+  // Closing prePc2 while still ringing/connecting finalizes webrtc_closed_while_ringing AND clicks hangup
+  prePc2.connectionState = 'closed';
+  prePc2.emit('connectionstatechange');
+  assert.equal(await sIn.done, 'missed');
+  assert.equal(hangupClicks, 1, 'webrtc_closed_while_ringing must click hangup');
+
+  // 2. Bounded timeout in openOwnerChat falls back to page.goto when WWebJS.getChat hangs
+  const envHang = makeFakeCallPage();
+  envHang.vmContext.WWebJS = {
+    getChat: () => new Promise(() => {}), // never resolves
+  };
+  envHang.callBtn.onClick = () => {
+    envHang.showCallOverlay('Ahmet\n0:00\nAramayı sonlandır');
+  };
+  const ctrlHang = createCallController({
+    client: { getPage: () => envHang.page },
+    config: {
+      ownerPhone: '905321112233',
+      ownerChatId: '905321112233@c.us',
+      callRingTimeoutSec: 0.05,
+    },
+    pollIntervalMs: 15,
+    chatOpenSettleMs: 5,
+  });
+
+  let connectedHangSession = null;
+  const sHang = await ctrlHang.startCallWithOwner({
+    onConnected(s) {
+      connectedHangSession = s;
+    },
+  });
+  assert.equal(envHang.gotoCalls.length, 1, 'hanging WWebJS.getChat must time out and fall back to page.goto');
+  await new Promise((r) => setTimeout(r, 25));
+  assert.ok(connectedHangSession);
+
+  // 3. hangUp('live_session_start_failed') even after wasConnected===true must return 'error' outcome
+  const outErr = await connectedHangSession.hangUp('live_session_start_failed');
+  assert.equal(outErr, 'error', 'live_session_start_failed after answer must classify as error, not answered');
+  assert.equal(await sHang.done, 'error');
+});
+

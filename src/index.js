@@ -247,16 +247,17 @@ export function createOrchestrator({
   }
 
   async function sendOwnerNotice(text) {
-    if (!text || !config?.ownerChatId) return null;
+    if (!text || !config?.ownerChatId) return false;
+    if (typeof whatsapp?.sendMessage !== 'function') return true;
     try {
       const sent = await whatsapp.sendMessage(config.ownerChatId, text);
       if (sent?.id) {
         store.markBotMessageId(sent.id);
       }
-      return sent;
+      return Boolean(sent && sent.sent !== false);
     } catch (err) {
       console.error('[orchestrator] Failed to notify owner:', err?.message || err);
-      return null;
+      return false;
     }
   }
 
@@ -281,7 +282,7 @@ export function createOrchestrator({
       return { notified: false, reason: 'disabled' };
     }
 
-    const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.0';
+    const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.2';
     const latestVersion = normalizeVersionString(refreshed.cachedLatestVersion);
     if (!latestVersion || !isNewerVersion(latestVersion, currentVersion)) {
       return { notified: false, reason: 'no_update' };
@@ -324,7 +325,7 @@ export function createOrchestrator({
     const now = nowFn();
     const assistantName = config?.assistantName || 'Veko';
     const repoUrl = config?.githubRepoUrl || DEFAULT_GITHUB_REPO_URL;
-    const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.0';
+    const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.2';
     const updateState = store?.getUpdateState?.() || {};
 
     if (!updateState.installNotifiedAt) {
@@ -450,7 +451,7 @@ export function createOrchestrator({
         lastCallStatus: 'answered',
         missedRetryCount: 0,
       });
-      if (store.getPendingCallChatId() === targetChatId) {
+      if (isSameChatIdentity(store.getPendingCallChatId?.(), targetChatId)) {
         store.setPendingCallChatId(null);
       }
       return;
@@ -538,7 +539,7 @@ export function createOrchestrator({
 
       const startLiveForCall = (session) => {
         callSession = session;
-        if (callEnded) return;
+        if (callEnded || liveConnecting || liveSession) return;
         liveConnecting = true;
 
         const toolExecutor = createTools({
@@ -572,10 +573,10 @@ export function createOrchestrator({
               onError: async (err) => {
                 console.error('[orchestrator] Gemini Live session error:', err?.message || err);
                 closeLiveSafely();
+                requestCallHangup('live_session_error');
                 await sendOwnerNotice(
                   `⚠️ ${config.assistantName || 'Asistan'} ses bağlantısı hatası (${noticeLabel}).`
                 );
-                requestCallHangup('live_session_error');
               },
               onClose: () => {
                 liveClosed = true;
@@ -605,10 +606,10 @@ export function createOrchestrator({
             liveConnecting = false;
             console.error('[orchestrator] startLiveSession failed:', err?.message || err);
             if (!callEnded) {
+              requestCallHangup('live_session_start_failed');
               await sendOwnerNotice(
                 `⚠️ ${config.assistantName || 'Asistan'} başlatılamadı (${noticeLabel}): ${err?.message || err}`
               );
-              requestCallHangup('live_session_start_failed');
             }
           });
       };
@@ -656,9 +657,26 @@ export function createOrchestrator({
     }
   }
 
+  function resolvePendingCustomerTrigger(chatId) {
+    if (!chatId) return '';
+    const delayed = getPendingDelayedByIdentity(chatId);
+    if (delayed && Array.isArray(delayed.messages) && delayed.messages.length > 0) {
+      return buildMergedSummary(delayed.messages);
+    }
+    const quietItems = store.getQuietQueue?.() || [];
+    for (const item of quietItems) {
+      if (item?.chatId && (item.chatId === chatId || isSameChatIdentity(item.chatId, chatId))) {
+        if (item.summary) return item.summary;
+        if (item.latestMessage) return item.latestMessage;
+      }
+    }
+    return '';
+  }
+
   async function initiateOwnerCall({ targetChatId, customerName, triggerBody }) {
     if (callRunning || callController.isCallActive?.()) {
-      await sendOwnerNotice(`📞 Zaten aktif bir arama var — ${customerName}: "${triggerBody}"`);
+      const activeTrigger = triggerBody || 'Patron arama isteği';
+      await sendOwnerNotice(`📞 Zaten aktif bir arama var — ${customerName}: "${activeTrigger}"`);
       return 'skipped';
     }
 
@@ -667,10 +685,18 @@ export function createOrchestrator({
       clearQuietQueueForChat(targetChatId);
     }
 
+    let resolvedTriggerBody = triggerBody || '';
+
     try {
       const { outcome, endedReason } = await runCallBridgeSession({
         startControllerCall: (callbacks) => callController.startCallWithOwner(callbacks),
-        getCustomerContext: () => loadCustomerContext(targetChatId, customerName, triggerBody),
+        getCustomerContext: async () => {
+          const ctx = await loadCustomerContext(targetChatId, customerName, triggerBody);
+          if (!resolvedTriggerBody && ctx?.triggerMessage) {
+            resolvedTriggerBody = ctx.triggerMessage;
+          }
+          return ctx;
+        },
         activeCustomerChatId: targetChatId,
         noticeLabel: customerName,
         preloadContext: true,
@@ -683,14 +709,24 @@ export function createOrchestrator({
         await sendOwnerNotice('⏱️ Maksimum görüşme süresi dolduğu için arama sonlandırıldı.');
       }
 
-      await handleCallOutcome(outcome, { targetChatId, customerName, triggerBody });
+      const outcomeTriggerBody = resolvedTriggerBody || 'Patron arama isteği';
+      await handleCallOutcome(outcome, {
+        targetChatId,
+        customerName,
+        triggerBody: outcomeTriggerBody,
+      });
       if (outcome === 'answered') {
         await maybeNotifyPendingUpdateAfterConversation();
       }
       return outcome;
     } catch (err) {
       console.error('[orchestrator] initiateOwnerCall failed:', err?.message || err);
-      await handleCallOutcome('error', { targetChatId, customerName, triggerBody });
+      const outcomeTriggerBody = resolvedTriggerBody || 'Patron arama isteği';
+      await handleCallOutcome('error', {
+        targetChatId,
+        customerName,
+        triggerBody: outcomeTriggerBody,
+      });
       return 'error';
     }
   }
@@ -754,7 +790,7 @@ export function createOrchestrator({
           lastCallStatus: 'answered',
           missedRetryCount: 0,
         });
-        if (store.getPendingCallChatId?.() === pendingChatId) {
+        if (isSameChatIdentity(store.getPendingCallChatId?.(), pendingChatId)) {
           store.setPendingCallChatId?.(null);
         }
       }
@@ -781,6 +817,37 @@ export function createOrchestrator({
     }
 
     if (command.type === 'resume') {
+      const now = nowFn();
+      const effectiveSettings = resolveCallSettings(config, store);
+      const scheduleState = store.getQuietScheduleState?.() || {};
+      const quietQueue = store.getQuietQueue?.() || [];
+      const quietStatus = evaluateQuietStatus(
+        effectiveSettings,
+        scheduleState,
+        now,
+        quietQueue.length
+      );
+      if (quietStatus.awaitingOwnerConfirm || quietStatus.snoozeActive) {
+        const queued = store.clearQuietQueue?.() || [];
+        store.setQuietScheduleState?.({
+          awaitingOwnerConfirm: false,
+          snoozedUntilMs: null,
+          pendingSnoozeDigest: false,
+          wasQuietPendingResume: false,
+          resumeConfirmedYmd: quietStatus.todayYmd,
+          ...(quietStatus.awaitingOwnerConfirm
+            ? { lastMorningPromptYmd: quietStatus.todayYmd }
+            : {}),
+        });
+        if (queued.length > 0) {
+          const digestText = formatQuietDigestMessage(queued, {
+            header: `🔔 ${assistantName} tekrar aktif! Gece/mesai dışı bekleyen mesajlar (${queued.length}):`,
+          });
+          await sendOwnerNotice(digestText);
+          appendSystemNoticeToHistory(digestText);
+          return;
+        }
+      }
       await sendOwnerNotice(
         `🔔 ${assistantName} tekrar aktif. Uygun mesajlarda arama yapılacak.`
       );
@@ -794,7 +861,7 @@ export function createOrchestrator({
       const pending = store.getPendingCallChatId();
       const updateState = store.getUpdateState?.() || {};
       const notifEnabled = updateState.updateNotificationsEnabled !== false;
-      const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.0';
+      const currentVersion = normalizeVersionString(config?.appVersion) || '0.2.2';
       const hasNewCached = Boolean(
         updateState.cachedLatestVersion &&
           isNewerVersion(updateState.cachedLatestVersion, currentVersion)
@@ -851,11 +918,32 @@ export function createOrchestrator({
         );
         return;
       }
-      const label = stripJid(pendingChatId);
+      let label = stripJid(pendingChatId);
+      const delayed = getPendingDelayedByIdentity(pendingChatId);
+      const quietItem = (store.getQuietQueue?.() || []).find(
+        (q) => q?.chatId && (q.chatId === pendingChatId || isSameChatIdentity(q.chatId, pendingChatId))
+      );
+      try {
+        const chat = await whatsapp.getChatById?.(pendingChatId);
+        if (chat?.name) {
+          label = chat.name;
+        } else if (delayed?.customerName) {
+          label = delayed.customerName;
+        } else if (quietItem?.customerName) {
+          label = quietItem.customerName;
+        }
+      } catch {
+        if (delayed?.customerName) {
+          label = delayed.customerName;
+        } else if (quietItem?.customerName) {
+          label = quietItem.customerName;
+        }
+      }
+      const pendingTrigger = resolvePendingCustomerTrigger(pendingChatId);
       await initiateOwnerCall({
         targetChatId: pendingChatId,
         customerName: label,
-        triggerBody: formatMessagePreview(msg) || 'Patron arama isteği',
+        triggerBody: pendingTrigger,
       });
       return;
     }
@@ -889,10 +977,11 @@ export function createOrchestrator({
       const match = matches[0];
       const targetChatId = match.chatId;
       const customerName = match.name || match.phone || stripJid(targetChatId);
+      const pendingTrigger = resolvePendingCustomerTrigger(targetChatId);
       await initiateOwnerCall({
         targetChatId,
         customerName,
-        triggerBody: formatMessagePreview(msg) || `Patron komutu: ara ${command.query}`,
+        triggerBody: pendingTrigger,
       });
       return;
     }
@@ -904,71 +993,71 @@ export function createOrchestrator({
 
   async function handleOwnerTextChat(decision, msg) {
     const ownerText = String(decision.messageText ?? msg?.body ?? decision.summaryText ?? '').trim();
+    const normalizedCmd = normalizeUpdateTogglePhrase(ownerText);
+    if (normalizedCmd === 'guncelleme bildirimi kapat') {
+      store.setUpdateState?.({ updateNotificationsEnabled: false });
+      await sendOwnerNotice(
+        '🔕 Güncelleme bildirimleri kapatıldı. İstediğiniz zaman "güncelleme bildirimi aç" yazarak tekrar açabilirsiniz.'
+      );
+      return { ...decision, updateNotificationsEnabled: false };
+    }
+    if (normalizedCmd === 'guncelleme bildirimi ac') {
+      store.setUpdateState?.({ updateNotificationsEnabled: true });
+      await sendOwnerNotice('🔔 Güncelleme bildirimleri açıldı.');
+      return { ...decision, updateNotificationsEnabled: true };
+    }
+
+    const now = nowFn();
+    const settings = resolveCallSettings(config, store);
+    const scheduleState = store.getQuietScheduleState?.() || {};
+    const quietQueue = store.getQuietQueue?.() || [];
+    const quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
+    if (quietStatus.awaitingOwnerConfirm && !store.getPendingOutgoingDraft?.(now)) {
+      if (/^(evet|baslasin|baslat|tamam|olur|onay|ac|basla)$/.test(normalizedCmd)) {
+        const queued = store.clearQuietQueue?.() || [];
+        store.setQuietScheduleState?.({
+          awaitingOwnerConfirm: false,
+          wasQuietPendingResume: false,
+          snoozedUntilMs: null,
+          pendingSnoozeDigest: false,
+          resumeConfirmedYmd: quietStatus.todayYmd,
+          lastMorningPromptYmd: quietStatus.todayYmd,
+        });
+        if (queued.length > 0) {
+          const digestText = formatQuietDigestMessage(queued, {
+            header: `✅ Mesai başlatıldı! Gece/mesai dışı bekleyen mesajlar (${queued.length}):`,
+          });
+          await sendOwnerNotice(digestText);
+          appendSystemNoticeToHistory(digestText);
+        } else {
+          await sendOwnerNotice('✅ Mesai başlatıldı. Yeni aramalar aktif.');
+        }
+        return { ...decision, action: 'owner_chat', reason: 'morning_resume_confirmed_fallback' };
+      }
+      const timeMatch = /^(\d{1,2}:\d{2})(?:\s*(?:ertele|sonra))?$/.exec(normalizedCmd);
+      const minsMatch = /^(\d{1,3})\s*(dk|dakika)(?:\s*(?:ertele|sonra))?$/.exec(normalizedCmd);
+      let snoozedUntilMs = null;
+      if (timeMatch) {
+        snoozedUntilMs = computeIstanbulTimeTargetMs(timeMatch[1], now);
+      } else if (minsMatch) {
+        const mins = Number(minsMatch[1]);
+        if (Number.isFinite(mins) && mins > 0 && mins <= 720) {
+          snoozedUntilMs = now + mins * 60_000;
+        }
+      }
+      if (snoozedUntilMs) {
+        store.setQuietScheduleState?.({
+          snoozedUntilMs,
+          pendingSnoozeDigest: true,
+          awaitingOwnerConfirm: false,
+          resumeConfirmedYmd: null,
+        });
+        await sendOwnerNotice('⏰ Mesai erteleme ayarlandı. Süre bitince bekleyen özet iletilecek.');
+        return { ...decision, action: 'owner_chat', reason: 'morning_snooze_fallback' };
+      }
+    }
+
     if (isTextDisabled()) {
-      const normalizedCmd = normalizeUpdateTogglePhrase(ownerText);
-      if (normalizedCmd === 'guncelleme bildirimi kapat') {
-        store.setUpdateState?.({ updateNotificationsEnabled: false });
-        await sendOwnerNotice(
-          '🔕 Güncelleme bildirimleri kapatıldı. İstediğiniz zaman "güncelleme bildirimi aç" yazarak tekrar açabilirsiniz.'
-        );
-        return { ...decision, updateNotificationsEnabled: false };
-      }
-      if (normalizedCmd === 'guncelleme bildirimi ac') {
-        store.setUpdateState?.({ updateNotificationsEnabled: true });
-        await sendOwnerNotice('🔔 Güncelleme bildirimleri açıldı.');
-        return { ...decision, updateNotificationsEnabled: true };
-      }
-
-      const now = nowFn();
-      const settings = resolveCallSettings(config, store);
-      const scheduleState = store.getQuietScheduleState?.() || {};
-      const quietQueue = store.getQuietQueue?.() || [];
-      const quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
-      if (quietStatus.awaitingOwnerConfirm) {
-        if (/^(evet|baslasin|baslat|tamam|olur|onay|ac|basla)$/.test(normalizedCmd)) {
-          const queued = store.clearQuietQueue?.() || [];
-          store.setQuietScheduleState?.({
-            awaitingOwnerConfirm: false,
-            wasQuietPendingResume: false,
-            snoozedUntilMs: null,
-            pendingSnoozeDigest: false,
-            resumeConfirmedYmd: quietStatus.todayYmd,
-            lastMorningPromptYmd: quietStatus.todayYmd,
-          });
-          if (queued.length > 0) {
-            const digestText = formatQuietDigestMessage(queued, {
-              header: `✅ Mesai başlatıldı! Gece/mesai dışı bekleyen mesajlar (${queued.length}):`,
-            });
-            await sendOwnerNotice(digestText);
-            appendSystemNoticeToHistory(digestText);
-          } else {
-            await sendOwnerNotice('✅ Mesai başlatıldı. Yeni aramalar aktif.');
-          }
-          return { ...decision, action: 'owner_chat', reason: 'morning_resume_confirmed_fallback' };
-        }
-        const timeMatch = /^(\d{1,2}:\d{2})/.exec(normalizedCmd);
-        const minsMatch = /^(\d{1,3})\s*(dk|dakika)\s*(ertele|sonra)?/.exec(normalizedCmd);
-        let snoozedUntilMs = null;
-        if (timeMatch) {
-          snoozedUntilMs = computeIstanbulTimeTargetMs(timeMatch[1], now);
-        } else if (minsMatch) {
-          const mins = Number(minsMatch[1]);
-          if (Number.isFinite(mins) && mins > 0 && mins <= 720) {
-            snoozedUntilMs = now + mins * 60_000;
-          }
-        }
-        if (snoozedUntilMs) {
-          store.setQuietScheduleState?.({
-            snoozedUntilMs,
-            pendingSnoozeDigest: true,
-            awaitingOwnerConfirm: false,
-            resumeConfirmedYmd: null,
-          });
-          await sendOwnerNotice('⏰ Mesai erteleme ayarlandı. Süre bitince bekleyen özet iletilecek.');
-          return { ...decision, action: 'owner_chat', reason: 'morning_snooze_fallback' };
-        }
-      }
-
       return {
         ...decision,
         action: 'ignore',
@@ -1025,7 +1114,7 @@ export function createOrchestrator({
 
   async function runScheduledTick(overrideNowMs) {
     const now = Number.isFinite(overrideNowMs) ? overrideNowMs : nowFn();
-    const settings = resolveCallSettings(config, store);
+    let settings = resolveCallSettings(config, store);
     let scheduleState = store.getQuietScheduleState?.() || {};
     let quietQueue = store.getQuietQueue?.() || [];
     let quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
@@ -1034,6 +1123,8 @@ export function createOrchestrator({
       scheduleState =
         store.setQuietScheduleState?.({
           wasQuietPendingResume: true,
+          awaitingOwnerConfirm: false,
+          lastMorningPromptYmd: null,
           ...(scheduleState.resumeConfirmedYmd === quietStatus.todayYmd
             ? {}
             : { resumeConfirmedYmd: null }),
@@ -1050,29 +1141,36 @@ export function createOrchestrator({
         const askText =
           `☀️ Günaydın! Saat ${quietStatus.hhMm} oldu, mesai başlasın mı?${countLine}\n` +
           'Başlatmak için "evet" / "başlasın", ertelemek için ör. "30 dk ertele" veya "10:30" yazabilirsiniz.';
-        await sendOwnerNotice(askText);
-        appendSystemNoticeToHistory(askText);
-        store.setQuietScheduleState?.({
-          lastMorningPromptYmd: quietStatus.todayYmd,
-          awaitingOwnerConfirm: true,
-          wasQuietPendingResume: false,
-        });
+        const noticeSent = await sendOwnerNotice(askText);
+        if (noticeSent) {
+          appendSystemNoticeToHistory(askText);
+          store.setQuietScheduleState?.({
+            lastMorningPromptYmd: quietStatus.todayYmd,
+            awaitingOwnerConfirm: true,
+            wasQuietPendingResume: false,
+          });
+        }
       } else {
+        let noticeSent = true;
         if (quietQueue.length > 0) {
           const digestText = formatQuietDigestMessage(quietQueue, {
             header: `☀️ Günaydın! Gece/mesai dışı bekleyen mesajlar (${quietQueue.length}):`,
           });
-          await sendOwnerNotice(digestText);
-          appendSystemNoticeToHistory(digestText);
-          store.clearQuietQueue?.();
+          noticeSent = await sendOwnerNotice(digestText);
+          if (noticeSent) {
+            appendSystemNoticeToHistory(digestText);
+            store.clearQuietQueue?.();
+          }
         }
-        store.setQuietScheduleState?.({
-          lastMorningPromptYmd: quietStatus.todayYmd,
-          awaitingOwnerConfirm: false,
-          wasQuietPendingResume: false,
-          pendingSnoozeDigest: false,
-          resumeConfirmedYmd: quietStatus.todayYmd,
-        });
+        if (noticeSent) {
+          store.setQuietScheduleState?.({
+            lastMorningPromptYmd: quietStatus.todayYmd,
+            awaitingOwnerConfirm: false,
+            wasQuietPendingResume: false,
+            pendingSnoozeDigest: false,
+            resumeConfirmedYmd: quietStatus.todayYmd,
+          });
+        }
       }
       scheduleState = store.getQuietScheduleState?.() || {};
       quietQueue = store.getQuietQueue?.() || [];
@@ -1080,19 +1178,24 @@ export function createOrchestrator({
     }
 
     if (quietStatus.shouldDeliverPostSnoozeDigest) {
+      let noticeSent = true;
       if (quietQueue.length > 0) {
         const digestText = formatQuietDigestMessage(quietQueue, {
           header: `⏰ Erteleme süresi bitti. Bekleyen mesajlar (${quietQueue.length}):`,
         });
-        await sendOwnerNotice(digestText);
-        appendSystemNoticeToHistory(digestText);
-        store.clearQuietQueue?.();
+        noticeSent = await sendOwnerNotice(digestText);
+        if (noticeSent) {
+          appendSystemNoticeToHistory(digestText);
+          store.clearQuietQueue?.();
+        }
       }
-      store.setQuietScheduleState?.({
-        snoozedUntilMs: null,
-        pendingSnoozeDigest: false,
-        wasQuietPendingResume: false,
-      });
+      if (noticeSent) {
+        store.setQuietScheduleState?.({
+          snoozedUntilMs: null,
+          pendingSnoozeDigest: false,
+          wasQuietPendingResume: false,
+        });
+      }
       scheduleState = store.getQuietScheduleState?.() || {};
       quietQueue = store.getQuietQueue?.() || [];
       quietStatus = evaluateQuietStatus(settings, scheduleState, now, quietQueue.length);
@@ -1100,71 +1203,90 @@ export function createOrchestrator({
 
     const delayedEntries = Object.values(store.getPendingDelayedCalls?.() || {});
     for (const entry of delayedEntries) {
-      if (!entry?.chatId || !Number.isFinite(entry.dueAtMs) || entry.dueAtMs > now) continue;
+      if (!entry?.chatId) continue;
+      const freshEntry = store.getPendingDelayedCall?.(entry.chatId);
+      if (!freshEntry) continue;
+
+      const tickNow = Number.isFinite(overrideNowMs) ? overrideNowMs : nowFn();
+      settings = resolveCallSettings(config, store);
+      scheduleState = store.getQuietScheduleState?.() || {};
+      quietQueue = store.getQuietQueue?.() || [];
+      quietStatus = evaluateQuietStatus(settings, scheduleState, tickNow, quietQueue.length);
+
+      if (!Number.isFinite(freshEntry.dueAtMs) || freshEntry.dueAtMs > tickNow) continue;
 
       const activeCall = callRunning || Boolean(callController.isCallActive?.());
       if (activeCall && !quietStatus.isQuietNow) {
-        const bumpedDueMs = now + 60_000;
-        store.upsertPendingDelayedCall?.({ ...entry, dueAtMs: bumpedDueMs });
-        armDelayTimer(entry.chatId, bumpedDueMs);
+        const bumpedDueMs = tickNow + 60_000;
+        store.upsertPendingDelayedCall?.({ ...freshEntry, dueAtMs: bumpedDueMs });
+        armDelayTimer(freshEntry.chatId, bumpedDueMs);
         continue;
       }
 
-      cancelPendingDelayedCall(entry.chatId);
-      const messages = Array.isArray(entry.messages) ? entry.messages.filter(Boolean) : [];
+      cancelPendingDelayedCall(freshEntry.chatId);
+      const messages = Array.isArray(freshEntry.messages) ? freshEntry.messages.filter(Boolean) : [];
       const summaryText = buildMergedSummary(messages);
       const latestMessage = messages[messages.length - 1] || '';
 
       if (quietStatus.isQuietNow) {
         store.enqueueQuietMessage?.({
-          chatId: entry.chatId,
-          customerName: entry.customerName || entry.chatId,
-          phone: String(entry.chatId).replace(/@.*$/, ''),
-          priority: entry.priority || 'normal',
+          chatId: freshEntry.chatId,
+          customerName: freshEntry.customerName || freshEntry.chatId,
+          phone: extractCustomerPhone(freshEntry.chatId),
+          priority: freshEntry.priority || 'normal',
           summary: summaryText,
           latestMessage,
-          atMs: now,
+          atMs: tickNow,
         });
         if (quietStatus.scheduledQuiet) {
-          store.setQuietScheduleState?.({ wasQuietPendingResume: true });
+          store.setQuietScheduleState?.({
+            wasQuietPendingResume: true,
+            awaitingOwnerConfirm: false,
+            lastMorningPromptYmd: null,
+            ...(scheduleState.resumeConfirmedYmd === quietStatus.todayYmd
+              ? {}
+              : { resumeConfirmedYmd: null }),
+          });
         }
         continue;
       }
 
-      const chatState = store.getChatState?.(entry.chatId);
+      const chatState = store.getChatState?.(freshEntry.chatId);
       const suppressionReason = evaluateCallSuppressionReason({
         store,
         chatState,
         config,
         callInProgress: false,
-        nowMs: now,
+        nowMs: tickNow,
       });
 
       if (suppressionReason || settings.callPolicy === 'on_demand') {
         const reason = suppressionReason || 'on_demand_policy';
         const silentReasons = new Set([
-          'silenced',
           'owner_active_window',
           'third_party_outreach',
           'recent_text_reply_cooldown',
           'answered_cooldown',
           'rejected_cooldown',
         ]);
+        if (reason === 'silenced' && messages.length <= 1) {
+          silentReasons.add('silenced');
+        }
         if (!silentReasons.has(reason) && summaryText) {
-          const quietNotice = `🔕 ${entry.customerName || entry.chatId}: ${summaryText}`;
+          const quietNotice = `🔕 ${freshEntry.customerName || freshEntry.chatId}: ${summaryText}`;
           await sendOwnerNotice(quietNotice);
           appendSystemNoticeToHistory(quietNotice);
         }
         continue;
       }
 
-      store.setPendingCallChatId?.(entry.chatId);
-      const noticeText = `📩 ${entry.customerName || entry.chatId}: ${summaryText}\n📞 ${config.assistantName || 'Asistan'} sizi arıyor...`;
+      store.setPendingCallChatId?.(freshEntry.chatId);
+      const noticeText = `📩 ${freshEntry.customerName || freshEntry.chatId}: ${summaryText}\n📞 ${config.assistantName || 'Asistan'} sizi arıyor...`;
       await sendOwnerNotice(noticeText);
       appendSystemNoticeToHistory(noticeText);
       await initiateOwnerCall({
-        targetChatId: entry.chatId,
-        customerName: entry.customerName || entry.chatId,
+        targetChatId: freshEntry.chatId,
+        customerName: freshEntry.customerName || freshEntry.chatId,
         triggerBody: summaryText,
       });
     }
@@ -1182,10 +1304,22 @@ export function createOrchestrator({
     }
   }
 
+  function restoreOrClearPendingCall(previousPendingCallChatId, targetChatId) {
+    if (
+      previousPendingCallChatId &&
+      !isSameChatIdentity(previousPendingCallChatId, targetChatId)
+    ) {
+      store.setPendingCallChatId?.(previousPendingCallChatId);
+    } else if (isSameChatIdentity(store.getPendingCallChatId?.(), targetChatId)) {
+      store.setPendingCallChatId?.(null);
+    }
+  }
+
   async function handleIncomingMessage(msg) {
     const now = nowFn();
     const callInProgress = callRunning || Boolean(callController.isCallActive?.());
-    const decision = evaluateIncomingMessage(msg, {
+    const previousPendingCallChatId = store.getPendingCallChatId?.() || null;
+    let decision = evaluateIncomingMessage(msg, {
       config,
       store,
       callInProgress,
@@ -1235,6 +1369,9 @@ export function createOrchestrator({
     const existingDelayed = getPendingDelayedByIdentity(targetChatId);
 
     if (shouldTriage) {
+      if (existingDelayed?.chatId) {
+        clearDelayTimerForChat(existingDelayed.chatId);
+      }
       if (isVoiceNote) {
         triage = {
           priority: 'urgent',
@@ -1252,15 +1389,41 @@ export function createOrchestrator({
       }
 
       if (triage.priority === 'ignore') {
-        if (store.getPendingCallChatId?.() === targetChatId) {
-          store.setPendingCallChatId(null);
+        if (existingDelayed?.chatId && Number.isFinite(existingDelayed.dueAtMs)) {
+          armDelayTimer(existingDelayed.chatId, existingDelayed.dueAtMs);
         }
+        restoreOrClearPendingCall(previousPendingCallChatId, targetChatId);
         return {
           ...decision,
           action: 'notify_only',
           reason: 'trivial_ignored',
           triage,
         };
+      }
+
+      if (decision.action === 'notify_and_call') {
+        const postTriageNow = nowFn();
+        const postTriageCallActive = callRunning || Boolean(callController.isCallActive?.());
+        const postTriageReason = evaluateCallSuppressionReason({
+          store,
+          chatState: store.getChatState(targetChatId),
+          config,
+          callInProgress: postTriageCallActive,
+          nowMs: postTriageNow,
+        });
+        if (postTriageReason) {
+          restoreOrClearPendingCall(previousPendingCallChatId, targetChatId);
+          decision = {
+            ...decision,
+            action: postTriageReason === 'owner_active_window' ? 'ignore' : 'notify_only',
+            reason: postTriageReason,
+          };
+          if (postTriageReason === 'owner_active_window') {
+            cancelPendingDelayedCall(targetChatId);
+            clearQuietQueueForChat(targetChatId);
+            return decision;
+          }
+        }
       }
     }
 
@@ -1271,9 +1434,7 @@ export function createOrchestrator({
       decision.action === 'notify_and_call';
 
     if (quietStatus.isQuietNow && !bypassQuietForCritical) {
-      if (store.getPendingCallChatId?.() === targetChatId) {
-        store.setPendingCallChatId(null);
-      }
+      restoreOrClearPendingCall(previousPendingCallChatId, targetChatId);
       const priorMsgs = existingDelayed?.messages || [];
       const baseSummary = triage.summary || decision.summaryText;
       const queuedSummary = priorMsgs.length > 0 ? buildMergedSummary(priorMsgs, baseSummary) : baseSummary;
@@ -1281,7 +1442,7 @@ export function createOrchestrator({
       store.enqueueQuietMessage?.({
         chatId: targetChatId,
         customerName,
-        phone: String(msg?.phone || targetChatId || '').replace(/@.*$/, ''),
+        phone: extractCustomerPhone(targetChatId, msg?.phone),
         priority: triage.priority || 'normal',
         summary: queuedSummary,
         latestMessage: decision.summaryText,
@@ -1290,6 +1451,8 @@ export function createOrchestrator({
       if (quietStatus.scheduledQuiet) {
         store.setQuietScheduleState?.({
           wasQuietPendingResume: true,
+          awaitingOwnerConfirm: false,
+          lastMorningPromptYmd: null,
           ...(scheduleState.resumeConfirmedYmd === quietStatus.todayYmd
             ? {}
             : { resumeConfirmedYmd: null }),
@@ -1303,7 +1466,53 @@ export function createOrchestrator({
       };
     }
 
+    const shouldSmartDelay =
+      (decision.action === 'notify_and_call' ||
+        (decision.action === 'notify_only' && decision.reason === 'call_in_progress')) &&
+      settings.callPolicy === 'smart' &&
+      triage.priority === 'normal' &&
+      settings.callDelayMinutes > 0;
+
+    if (shouldSmartDelay) {
+      restoreOrClearPendingCall(previousPendingCallChatId, targetChatId);
+      const currentDelayed = getPendingDelayedByIdentity(targetChatId);
+      const canonicalChatId = currentDelayed?.chatId || targetChatId;
+      const dueAtMs = now + Math.round(settings.callDelayMinutes * 60_000);
+      const nextMessages = [...(currentDelayed?.messages || []), triggerBody];
+      store.upsertPendingDelayedCall?.({
+        chatId: canonicalChatId,
+        customerName,
+        dueAtMs,
+        firstMessageAt: currentDelayed?.firstMessageAt ?? now,
+        lastMessageAt: now,
+        messages: nextMessages,
+        priority: 'normal',
+        reason: triage.reason || 'delayed_debounce',
+      });
+      armDelayTimer(canonicalChatId, dueAtMs);
+
+      if (!currentDelayed) {
+        const delayedNotice = `📩 ${customerName}: ${decision.summaryText}\n⏳ Normal mesaj — müşteri yazmayı bırakınca (${settings.callDelayMinutes} dk sonra) aranacaksınız.`;
+        await sendOwnerNotice(delayedNotice);
+        appendSystemNoticeToHistory(delayedNotice);
+      }
+      return {
+        ...decision,
+        action: 'notify_only',
+        reason: 'smart_delayed',
+        dueAtMs,
+        triage,
+      };
+    }
+
     if (decision.action === 'notify_only') {
+      if (
+        existingDelayed?.chatId &&
+        Number.isFinite(existingDelayed.dueAtMs) &&
+        store.getPendingDelayedCall?.(existingDelayed.chatId)
+      ) {
+        armDelayTimer(existingDelayed.chatId, existingDelayed.dueAtMs);
+      }
       const noticeText =
         decision.reason === 'voice_disabled'
           ? `🔕 ${customerName} (Sesli arama kapalı - AI_VOICE_PROVIDER=none): ${decision.summaryText}`
@@ -1316,43 +1525,6 @@ export function createOrchestrator({
     }
 
     if (decision.action === 'notify_and_call') {
-      if (
-        settings.callPolicy === 'smart' &&
-        triage.priority === 'normal' &&
-        settings.callDelayMinutes > 0
-      ) {
-        if (store.getPendingCallChatId?.() === targetChatId) {
-          store.setPendingCallChatId(null);
-        }
-        const existingDelayed = store.getPendingDelayedCall?.(targetChatId);
-        const dueAtMs = now + Math.round(settings.callDelayMinutes * 60_000);
-        const nextMessages = [...(existingDelayed?.messages || []), triggerBody];
-        store.upsertPendingDelayedCall?.({
-          chatId: targetChatId,
-          customerName,
-          dueAtMs,
-          firstMessageAt: existingDelayed?.firstMessageAt ?? now,
-          lastMessageAt: now,
-          messages: nextMessages,
-          priority: 'normal',
-          reason: triage.reason || 'delayed_debounce',
-        });
-        armDelayTimer(targetChatId, dueAtMs);
-
-        if (!existingDelayed) {
-          const delayedNotice = `📩 ${customerName}: ${decision.summaryText}\n⏳ Normal mesaj — müşteri yazmayı bırakınca (${settings.callDelayMinutes} dk sonra) aranacaksınız.`;
-          await sendOwnerNotice(delayedNotice);
-          appendSystemNoticeToHistory(delayedNotice);
-        }
-        return {
-          ...decision,
-          action: 'notify_only',
-          reason: 'smart_delayed',
-          dueAtMs,
-          triage,
-        };
-      }
-
       const priorMsgs = existingDelayed?.messages || [];
       const mergedSummary =
         priorMsgs.length > 0 ? buildMergedSummary(priorMsgs, decision.summaryText) : decision.summaryText;

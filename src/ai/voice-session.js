@@ -1,8 +1,32 @@
 import { startGeminiLiveSession } from './live-session.js';
 import { startOpenAIRealtimeSession } from './openai-realtime.js';
 
+const GEMINI_ONLY_VOICES = new Set(['aoede', 'puck', 'charon', 'fenrir', 'kore']);
+
+function resolveOpenAIVoiceName(...candidates) {
+  for (const candidate of candidates) {
+    const trimmed = String(candidate || '').trim();
+    if (trimmed && !GEMINI_ONLY_VOICES.has(trimmed.toLowerCase())) {
+      return trimmed;
+    }
+  }
+  return 'cedar';
+}
+
 function normalizeVoiceConfig(config = {}) {
   if (config?.aiVoice && typeof config.aiVoice === 'object' && config.aiVoice.provider) {
+    const prov = String(config.aiVoice.provider).trim().toLowerCase();
+    if (prov === 'openai') {
+      return {
+        ...config.aiVoice,
+        provider: 'openai',
+        voiceName: resolveOpenAIVoiceName(
+          config.aiVoice.voiceName,
+          config?.aiVoiceName,
+          config?.ttsVoiceName
+        ),
+      };
+    }
     return config.aiVoice;
   }
 
@@ -16,7 +40,7 @@ function normalizeVoiceConfig(config = {}) {
       apiKey: String(config?.aiVoiceApiKey || config?.openaiApiKey || '').trim(),
       model: String(config?.aiVoiceModel || config?.openaiRealtimeModel || 'gpt-realtime-2.1').trim(),
       baseUrl: String(config?.aiVoiceBaseUrl || 'wss://api.openai.com/v1/realtime').trim(),
-      voiceName: String(config?.aiVoiceName || config?.ttsVoiceName || 'cedar').trim() || 'cedar',
+      voiceName: resolveOpenAIVoiceName(config?.aiVoiceName, config?.ttsVoiceName),
     };
   }
   return {
